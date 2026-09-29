@@ -3,8 +3,8 @@
 Per frame (no optimization, no dataset annotations):
 1. masks: |live frame - static background rendered from that camera| (in that camera's color)
 2. carve: coarse voxels (8 cm) then fine voxels (2 cm) inside occupied coarse cells; a voxel is
-   occupied if it falls inside the masks of all cameras that see it, tolerating a few misses
-   (mask holes where a shirt matches the wall) -- a missing camera simply doesn't carve
+   occupied if it falls inside the masks of most cameras that see it (a fraction may miss:
+   mask holes where a shirt matches the wall) -- a missing camera simply doesn't carve
 3. render: voxels become small Gaussians colored per view from the nearest real cameras that
    see them (occlusion via hull depth maps), composited with the background in one rasterization
 
@@ -29,10 +29,10 @@ class VisualHull:
     single_frame = False
 
     def __init__(self, coarse_cm: float = 8.0, fine_cm: float = 2.0, height_cm: float = 220.0,
-                 mask_thresh: float = 0.12, misses: int = 2, min_views: int = 3, k_views: int = 3,
+                 mask_thresh: float = 0.08, miss_frac: float = 0.1, min_views: int = 3, k_views: int = 3,
                  ckpt_dir: str | Path | None = None, device: str = "cuda", **_):
         self.coarse, self.fine, self.height = coarse_cm, fine_cm, height_cm
-        self.mask_thresh, self.misses, self.min_views, self.k = mask_thresh, misses, min_views, k_views
+        self.mask_thresh, self.miss_frac, self.min_views, self.k = mask_thresh, miss_frac, min_views, k_views
         self.ckpt_dir = Path(ckpt_dir) if ckpt_dir else None
         self.device = device
         self.frame_cache: dict[int, dict] = {}
@@ -103,13 +103,14 @@ class VisualHull:
         idx = v.long().clamp(0, H - 1) * W + u.long().clamp(0, W - 1)
         inside = masks.view(V, -1).gather(1, idx) & vis
         seen, hits = vis.sum(0), inside.sum(0)
-        return (seen >= self.min_views) & (hits >= seen - self.misses)
+        return (seen >= self.min_views) & (hits >= (1 - self.miss_frac) * seen)
 
     @torch.no_grad()
-    def process(self, images_np: dict[str, np.ndarray], timer: StageTimer) -> dict:
-        cams = [c for c in images_np if c in self.cams]
-        with timer("upload"):   # production: NVDEC decodes straight into GPU memory
-            u8 = torch.from_numpy(np.stack([images_np[c] for c in cams])).to(self.device, non_blocking=True)
+    def process(self, images: dict, timer: StageTimer) -> dict:
+        """images: cam -> RGB uint8 (H, W, 3), numpy or GPU tensor (live ingest decodes to GPU)."""
+        cams = [c for c in images if c in self.cams]
+        with timer("upload"):
+            u8 = torch.stack([torch.as_tensor(images[c]).to(self.device, non_blocking=True) for c in cams])
         with timer("masks"):
             imgs = u8.float() / 255
             plates = torch.stack([self.plates[c] for c in cams])

@@ -86,14 +86,15 @@ def main():
     with VideoWriter(str(out / f"{args.method}{tag}.mp4"), W, H, fps=args.fps) as vw:
         for k, f in enumerate(frames):
             t = k / args.fps
-            fs = sync.assemble(k, f, streams.packets(k))
+            n_before = {s: len(v) for s, v in timer.times.items()}
+            with timer("sync_health"):
+                fs = sync.assemble(k, f, streams.packets(k))
             status_counts.update(fs.status.values())
             if t < busy_until and last_img is not None:        # pipeline still busy: slot dropped
                 dropped += 1
                 img = last_img.copy()
                 label(img, f"DROPPED slot {k}", pos="top")
             else:
-                n_before = {s: len(v) for s, v in timer.times.items()}
                 state = method.process(fs.images, timer)
                 img = method.render_view(state, path[k], timer)
                 ms = sum(v[-1] for s, v in timer.times.items() if len(v) > n_before.get(s, 0))

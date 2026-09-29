@@ -7,8 +7,10 @@ invalid for that slot -- the pipeline never waits.
 """
 from dataclasses import dataclass, field
 
-import cv2
 import numpy as np
+import torch
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 
 from fvv.data import MultiViewSequence
 from .faults import FaultConfig
@@ -20,7 +22,7 @@ class Packet:
     frame: int               # source frame id (capture index)
     capture_t: float         # seconds
     arrival_t: float         # seconds
-    image: np.ndarray | None # RGB uint8 as decoded (may be degraded / resized)
+    image: torch.Tensor | None  # RGB uint8 (H, W, 3) on the GPU, as decoded (may be degraded / resized)
     decode_error: bool = False
 
 
@@ -29,20 +31,20 @@ class FrameSet:
     slot: int
     t: float
     frame: int
-    images: dict[str, np.ndarray] = field(default_factory=dict)   # valid cameras only
+    images: dict[str, torch.Tensor] = field(default_factory=dict)  # valid cameras only (GPU)
     status: dict[str, str] = field(default_factory=dict)          # cam -> ok|missing|late|frozen|blank|blur|corrupt|resized
 
 
 class ReplayStreams:
-    """Replays a MultiViewSequence as live streams with faults. Frames are preloaded (decode is
-    done by NVDEC in production; here it is out of the measured path)."""
+    """Replays a MultiViewSequence as live streams with faults. Frames are preloaded into GPU
+    memory, as an NVDEC ingest would deliver them (decode itself is out of the measured path)."""
 
     def __init__(self, seq: MultiViewSequence, cams: list[str], frames: list[int], faults: FaultConfig,
-                 fps: float = 30.0):
+                 fps: float = 30.0, device: str = "cuda"):
         self.seq, self.cams, self.frames, self.faults, self.fps = seq, cams, frames, faults, fps
         self.rng = np.random.default_rng(faults.seed)
         # includes the dataset's own dropped (blank) frames, so health checks see them live
-        self.cache = {(c, f): seq.image(c, f) for f in frames for c in cams}
+        self.cache = {(c, f): torch.from_numpy(seq.image(c, f)).to(device) for f in frames for c in cams}
 
     def packets(self, k: int) -> list[Packet]:
         """All packets captured at slot k (one per camera, unless dropped)."""
@@ -61,15 +63,29 @@ class ReplayStreams:
             err = False
             if img is not None:
                 if any(w.active(c, t) for w in fc.blurs):
-                    img = cv2.GaussianBlur(img, (0, 0), 6)
+                    img = _chw_to_hwc(TF.gaussian_blur(_hwc_to_chw(img), 37, 6.0))
                 for cam, tc in fc.corrupts:          # invalid from error until next keyframe
                     if cam == c and tc <= t < (int(tc * self.fps) // fc.gop + 1) * fc.gop / self.fps:
                         err = True
-                for cam, tr, s in fc.res_changes:
+                for cam, tr, sc in fc.res_changes:
                     if cam == c and t >= tr:
-                        img = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+                        H, W = img.shape[:2]
+                        img = _resize(img, (int(H * sc), int(W * sc)), "area")
             out.append(Packet(c, src, t, arrival, img, err))
         return out
+
+
+def _hwc_to_chw(img: torch.Tensor) -> torch.Tensor:
+    return img.permute(2, 0, 1).float()
+
+
+def _chw_to_hwc(x: torch.Tensor) -> torch.Tensor:
+    return x.clamp(0, 255).round().byte().permute(1, 2, 0).contiguous()
+
+
+def _resize(img: torch.Tensor, size: tuple[int, int], mode: str) -> torch.Tensor:
+    kw = {} if mode == "area" else {"align_corners": False}
+    return _chw_to_hwc(F.interpolate(_hwc_to_chw(img)[None], size=size, mode=mode, **kw)[0])
 
 
 class Synchronizer:
@@ -79,8 +95,9 @@ class Synchronizer:
     def __init__(self, cams: list[str], expected_size: dict[str, tuple[int, int]], fps: float = 30.0,
                  buffer_ms: float = 100.0):
         self.cams, self.expected, self.fps, self.buffer = cams, expected_size, fps, buffer_ms / 1000
-        self.last_hash: dict[str, float] = {}
+        self.last_small: dict[str, torch.Tensor] = {}
         self.sharp_ref: dict[str, float] = {}
+        self.lap = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)[None, None]
 
     def assemble(self, k: int, frame: int, packets: list[Packet]) -> FrameSet:
         t = k / self.fps
@@ -97,22 +114,23 @@ class Synchronizer:
                 fs.images[p.cam] = img
         return fs
 
-    def _health(self, p: Packet) -> tuple[str, np.ndarray | None]:
+    def _health(self, p: Packet) -> tuple[str, torch.Tensor | None]:
         img = p.image
         W, H = self.expected[p.cam]
         status = "ok"
         if img.shape[1] != W or img.shape[0] != H:
             # resolution changed mid-stream: same field of view assumed -> resample to calibrated size
-            img = cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
+            img = _resize(img, (H, W), "bilinear")
             status = "resized"
-        small = cv2.resize(img, (W // 8, H // 8), interpolation=cv2.INTER_AREA)
-        if small.reshape(-1, 3).std(0).max() < 8:
+        small = F.interpolate(_hwc_to_chw(img)[None], size=(H // 8, W // 8), mode="area")[0]
+        if small.reshape(3, -1).std(1).max().item() < 8:
             return "blank", None
-        h = float(small.astype(np.float32).mean() + small[::7, ::7].astype(np.float32).std())
-        if self.last_hash.get(p.cam) == h:
+        prev = self.last_small.get(p.cam)
+        self.last_small[p.cam] = small
+        if prev is not None and torch.equal(prev, small):
             return "frozen", None
-        self.last_hash[p.cam] = h
-        sharp = cv2.Laplacian(cv2.cvtColor(small, cv2.COLOR_RGB2GRAY), cv2.CV_32F).var()
+        gray = small.mean(0)[None, None]
+        sharp = F.conv2d(gray, self.lap.to(gray.device)).var().item()
         ref = self.sharp_ref.setdefault(p.cam, sharp)
         self.sharp_ref[p.cam] = 0.95 * ref + 0.05 * sharp if sharp > 0.5 * ref else ref
         if sharp < 0.3 * ref:
