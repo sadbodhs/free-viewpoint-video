@@ -83,6 +83,47 @@ the offline layered results as extra targets. Temporal smoothing across frames r
 - Offline layered results become the quality reference Tier A/B are compared against, and
   training targets for Tier B.
 
+## Robustness with live (RTSP) feeds
+
+**Principle: never wait for a late camera.** Frames are assembled into fixed 33 ms slots by
+*capture* timestamp; whatever is missing or late for a slot is invalid for that slot only
+(the live version of `invalid_frames` / `valid_cameras`). Every method must work with a
+different camera subset each frame.
+
+| Issue | Effect | Handling |
+|---|---|---|
+| Camera down / stream stalls | fewer views | health monitor (arrival gaps, decode errors, frozen/blank frames); visual hull treats a missing camera as "don't carve", feed-forward picks nearest *available* views; allowed viewer region shrinks around the gap; reconnect with backoff, re-verify calibration before reuse |
+| RTP jitter | out-of-sync views | per-stream jitter buffer (50–150 ms), match by RTP→NTP capture time (RTCP SR), cameras on PTP/NTP |
+| Resolution / fps change mid-stream | decoder reinit, intrinsics mismatch | reinit decoder, rescale K (`Camera.scaled`); aspect/crop change → recalibrate |
+| Packet loss | blocky/smeared frames until next I-frame | mark invalid until IDR; request GOP ≤ 1 s, no B-frames (latency) |
+| Auto exposure / WB / focus | color & sharpness drift | lock on camera; online per-camera color affine vs. background render |
+| Motion blur / defocus | soft sources | sharpness score (Laplacian variance) → lower weight in texturing/selection |
+| Rolling shutter | fast objects skewed | global-shutter cameras for the rig; else per-row time correction |
+| Camera bumped / drifts | misaligned view | live frame vs. background rendered from that camera; error jump → re-estimate pose (PnP against background) |
+| Lighting change, glare, dirt, rain, occluding spectator | one camera silently bad | per-camera error vs. background render → demote; online background color update; shutter set against 50/60 Hz flicker |
+| Transport | loss vs. delay | RTSP-over-TCP or SRT; multicast for multiple consumers; isolated camera network, credentials in a secret store |
+
+**Adding cameras dynamically.** Intrinsics once per camera+lens (avoid zoom/PTZ unless it
+reports zoom). Pose without a board: match the new view against renders of the static
+background splat → PnP + RANSAC → refine (court lines where available). Time offset via
+PTP/NTP or motion/audio cross-correlation; color affine fit in seconds. A new camera is on
+probation until reprojection and cross-camera checks pass.
+
+**Zooming past the source resolution.** Cap zoom adaptively from the best source camera's
+pixel density at the look-at point (~1.5–2×), anti-aliased (Mip-Splatting-style) rasterization,
+blend toward the real camera image when the view ray aligns with one, render the zoomed crop
+at higher internal resolution; generative super-resolution only as an optional, labelled mode.
+
+**Capacity (estimates, RTX 3090; R0 measures the real numbers).** NVDEC ~15–25 streams of
+1080p30; masks ~0.3–1 ms/camera; visual hull scales with voxels × cameras (16 cams × 256³ ≈ a
+few ms); feed-forward people cost is per *viewer* (uses 2–4 nearest cameras), not per camera;
+render ~5 ms/viewer; GeForce NVENC limits concurrent encode sessions (data-center GPUs don't).
+One 3090 ≈ 8–16 cameras + a few viewers; beyond that split ingest nodes (~16 cams/GPU) from
+render nodes (~5 viewers/GPU) or render client-side.
+
+**R0 fault injection.** The replay harness can drop cameras, add jitter, change resolution,
+blur/freeze streams and corrupt frames, so every method is scored under failures too.
+
 ## Scaling to many viewers
 
 - **Server-side rendering first**: ~5 ms per view → ~5 concurrent viewers per 3090 at 30 fps,

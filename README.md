@@ -51,6 +51,25 @@ scripts/run.sh python scripts/triangulate_points.py data/panoptic/170221_hagglin
 scripts/run.sh python scripts/evaluate.py data/panoptic/170221_haggling_b1 --method 3dgs
 ```
 
+## Phase 2: moving 3D video (layered)
+
+```bash
+# static background from key frames (people masked) + people tracked per frame
+scripts/run.sh python scripts/evaluate.py data/panoptic/170221_haggling_b1 --method layered --frame-step 5
+scripts/run.sh python scripts/render_flythrough.py data/panoptic/170221_haggling_b1 --method layered
+```
+
+## Real time: R0 live replay + R1 visual hull
+
+```bash
+# GPU visual hull people over the static background (no per-frame optimization)
+scripts/run.sh python scripts/evaluate.py data/panoptic/170221_haggling_b1 --method hull --frame-step 5
+
+# replay the capture as live streams; optional fault injection (fvv/live/faults.py)
+scripts/run.sh python scripts/live_replay.py data/panoptic/170221_haggling_b1 --method hull \
+    --faults "jitter=40,drop=00_05@1-3,freeze=00_07@2-3,blur=00_03@0.5-4,corrupt=00_10@1.5,res=00_04@2x0.5"
+```
+
 ## Result videos
 
 Every method gets the same two videos:
@@ -72,6 +91,7 @@ fvv/eval/     PSNR/SSIM/LPIPS, held-out-camera protocol, per-stage latency timer
 fvv/methods/  novel-view methods (fit + render interface in fvv/eval/protocol.py)
 fvv/geometry/ COLMAP triangulation with known poses
 fvv/render/   shared virtual camera paths, video writer, overlays
+fvv/live/     simulated live streams, fault injection, frame synchronizer, health checks
 scripts/      dataset download, checks, evaluation
 docker/       Dockerfile + requirements
 ```

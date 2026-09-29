@@ -10,6 +10,11 @@ from . import COCO19_EDGES
 from .camera import Camera
 
 
+# Capsule radius (cm) per COCO19_EDGES entry: generous for head/torso (hair, loose clothes),
+# tight for shins and forearms so feet and hands don't claim the floor or background around them.
+EDGE_RADIUS = [35, 35, 20, 20, 35, 35, 25, 15, 35, 25, 15, 35, 20, 20]
+
+
 def bones(bodies: list[dict], edges=COCO19_EDGES) -> dict[tuple[int, int], tuple[np.ndarray, np.ndarray]]:
     """{(body_id, edge_idx): (a, b)} for bones whose both joints are observed."""
     out = {}
@@ -68,3 +73,15 @@ def bone_motion(prev: dict, cur: dict) -> dict[tuple[int, int], tuple[np.ndarray
             R, _ = cv2.Rodrigues(axis * np.arctan2(s, c))
         out[k] = (R, a0, a1)
     return out
+
+
+def estimate_floor(seq) -> tuple[np.ndarray, float]:
+    """(world 'down' unit vector, floor height along it) from ankle joints over the clip.
+
+    'down' is the mean camera image-down axis; ankles sit ~8 cm above the floor.
+    """
+    down = np.mean([c.R[1] for c in seq.cameras.values()], axis=0)
+    down /= np.linalg.norm(down)
+    h = [b["joints"][j, :3] @ down for f in seq.frame_ids for b in seq.bodies(f)
+         for j in (8, 14) if b["joints"][j, 3] > 0]
+    return down, float(np.percentile(h, 90) + 8.0)

@@ -24,7 +24,7 @@ from gsplat.strategy import MCMCStrategy
 from gsplat.strategy.ops import relocate, sample_add
 
 from fvv.data import Camera, MultiViewSequence
-from fvv.data.people import bone_motion, bones, capsule_mask, sample_capsules
+from fvv.data.people import EDGE_RADIUS, bone_motion, bones, capsule_mask, sample_capsules
 from fvv.eval import StageTimer
 from fvv.geometry import load_points_ply
 from .gaussian_splat import SH_C0, GaussianSplat, apply_affine, photometric_loss
@@ -83,12 +83,26 @@ class LayeredSplat:
         return (X - self.bg.center) / self.bg.scale
 
     def _bones_t(self, seq: MultiViewSequence, frame: int):
-        """(keys, a, b) of observed bones at `frame`, as normalized-coordinate tensors."""
+        """(keys, a, b, bones) of observed bones at `frame`, as normalized-coordinate tensors.
+        Also sets self._r: per-bone capsule radius (normalized)."""
         bs = bones(seq.bodies(frame))
         keys = list(bs)
         a = torch.tensor(self._norm(np.array([bs[k][0] for k in keys])), dtype=torch.float32, device=self.device)
         b = torch.tensor(self._norm(np.array([bs[k][1] for k in keys])), dtype=torch.float32, device=self.device)
+        self._r = torch.tensor([EDGE_RADIUS[k[1]] for k in keys], dtype=torch.float32,
+                               device=self.device) / self.bg.scale
         return keys, a, b, bs
+
+    def _estimate_floor(self, seq: MultiViewSequence) -> None:
+        """Floor height along world 'down' from ankle joints over the clip (ankles sit ~8 cm up)."""
+        down = np.mean([c.R[1] for c in seq.cameras.values()], axis=0)
+        self.down = down / np.linalg.norm(down)
+        h = [b["joints"][j, :3] @ self.down for f in seq.frame_ids for b in seq.bodies(f)
+             for j in (8, 14) if b["joints"][j, 3] > 0]
+        floor = np.percentile(h, 90) + 8.0
+        self.floor_n = float((floor - self.bg.center @ self.down) / self.bg.scale)
+        self.down_t = torch.tensor(self.down, dtype=torch.float32, device=self.device)
+        print(f"[layered] floor at {floor:.1f} cm along down (from {len(h)} ankle observations)")
 
     def _views(self, seq: MultiViewSequence, frame: int, cams: list[str], with_masks: bool = False):
         cams = [seq.camera(c) for c in seq.valid_cameras(frame, cams)]
@@ -131,6 +145,7 @@ class LayeredSplat:
                 self.bg.save(bg_ckpt)
         for p in self.bg.params.values():
             p.requires_grad_(False)
+        self._estimate_floor(seq)
 
         if fg_ckpt and fg_ckpt.exists() and not self.retrain:
             self.states = torch.load(fg_ckpt, map_location=self.device, weights_only=False)
@@ -221,18 +236,21 @@ class LayeredSplat:
 
     @torch.no_grad()
     def _constrain(self, fg: dict, a: torch.Tensor, b: torch.Tensor) -> None:
-        """Hard people prior: project Gaussians that left the capsules back onto their surface,
-        and cap their size so they cannot stretch into streaks across the background."""
-        r = self.radius / self.bg.scale
+        """Hard people prior: project Gaussians that left their bone's capsule back onto its
+        surface, keep them above the floor, and cap their size so they cannot stretch into
+        streaks across the background."""
         x = fg["means"].data
         d, idx = seg_distance(x, a, b)
+        r = self._r[idx]
         out = d > r
         if out.any():
             ai, bi, xo = a[idx[out]], b[idx[out]], x[out]
             ab = bi - ai
             t = (((xo - ai) * ab).sum(-1) / (ab * ab).sum(-1).clamp(min=1e-12)).clamp(0, 1)
             c = ai + t[:, None] * ab
-            x[out] = c + (xo - c) * (r / d[out])[:, None]
+            x[out] = c + (xo - c) * (r[out] / d[out])[:, None]
+        below = (x @ self.down_t - self.floor_n).clamp(min=0)
+        x -= below[:, None] * self.down_t
         fg["scales"].data.clamp_(max=float(np.log(self.max_scale / self.bg.scale)))
 
     def _fit_people_frame0(self, seq: MultiViewSequence, frame: int) -> dict:
