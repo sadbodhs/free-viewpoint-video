@@ -11,7 +11,10 @@ def make_method(name: str, **kwargs):
     if name == "dyn3dgs":
         from .dynamic_splat import DynamicSplat
         return DynamicSplat(**kwargs)
+    if name == "layered":
+        from .layered_splat import LayeredSplat
+        return LayeredSplat(**kwargs)
     raise ValueError(f"unknown method {name!r}")
 
 
-METHODS = ["nearest_view", "3dgs", "3dgs_noaffine", "dyn3dgs"]
+METHODS = ["nearest_view", "3dgs", "3dgs_noaffine", "dyn3dgs", "layered"]

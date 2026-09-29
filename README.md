@@ -4,14 +4,17 @@ Render a multi-camera recording from any virtual viewpoint, working toward real 
 
 Roadmap:
 0. **Data layer + held-out-camera evaluation** ✓
-1. **Offline 3D Gaussian Splatting quality baseline** ← current
-2. Static background / dynamic foreground split
+1. **Offline 3D Gaussian Splatting quality baseline** ✓
+2. **Static background / dynamic people (layered, tracked 3D video)** ← current
 3. Real-time GPU visual hull + view-dependent texturing
 4. Real-time neural rendering (feed-forward / temporal Gaussians)
 5. Small fast objects (ball/shuttle): detect, triangulate, render synthetically
 6. Streaming server + interactive web viewer
 7. Own capture rig (sync, calibration)
 8. Generalization: uncalibrated/moving cameras, sparse views
+
+How the offline phases turn into a live system (latency budget, milestones R0–R6):
+[docs/REALTIME.md](docs/REALTIME.md).
 
 ## Environment
 

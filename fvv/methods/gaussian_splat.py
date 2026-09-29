@@ -22,8 +22,9 @@ from fvv.geometry import load_points_ply
 SH_C0 = 0.28209479177387814
 
 
-def ssim(x: torch.Tensor, y: torch.Tensor, window: int = 11, sigma: float = 1.5) -> torch.Tensor:
-    """Mean SSIM of (B, 3, H, W) images in [0, 1]."""
+def ssim(x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor | None = None,
+         window: int = 11, sigma: float = 1.5) -> torch.Tensor:
+    """Mean SSIM of (B, 3, H, W) images in [0, 1], optionally over a (B, 1, H, W) mask."""
     r = torch.arange(window, device=x.device, dtype=x.dtype) - window // 2
     g = torch.exp(-r ** 2 / (2 * sigma ** 2))
     g = g / g.sum()
@@ -32,7 +33,33 @@ def ssim(x: torch.Tensor, y: torch.Tensor, window: int = 11, sigma: float = 1.5)
     mx, my = conv(x), conv(y)
     sxx, syy, sxy = conv(x * x) - mx ** 2, conv(y * y) - my ** 2, conv(x * y) - mx * my
     c1, c2 = 0.01 ** 2, 0.03 ** 2
-    return (((2 * mx * my + c1) * (2 * sxy + c2)) / ((mx ** 2 + my ** 2 + c1) * (sxx + syy + c2))).mean()
+    s = ((2 * mx * my + c1) * (2 * sxy + c2)) / ((mx ** 2 + my ** 2 + c1) * (sxx + syy + c2))
+    if mask is None:
+        return s.mean()
+    return (s * mask).sum() / (mask.sum() * 3).clamp(min=1)
+
+
+def photometric_loss(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    """0.8 L1 + 0.2 D-SSIM on (H, W, 3) images, optionally restricted to a (H, W) bool mask."""
+    if mask is None:
+        l1 = (pred - gt).abs().mean()
+        m = None
+    else:
+        m = mask[..., None].float()
+        l1 = ((pred - gt).abs() * m).sum() / (m.sum() * 3).clamp(min=1)
+        m = m.permute(2, 0, 1)[None]
+    return 0.8 * l1 + 0.2 * (1 - ssim(pred.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None], m))
+
+
+def apply_affine(img: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
+    """Apply a 3x4 color transform to an (H, W, 3) image."""
+    return img @ A[:, :3].T + A[:, 3]
+
+
+def gauge_fixed(affine: torch.Tensor) -> torch.Tensor:
+    """Per-camera transforms relative to their mean: the shared color space is 'the average
+    camera' and cannot drift (e.g. darker scene + brighter transforms)."""
+    return affine - affine.mean(0) + torch.eye(3, 4, device=affine.device)
 
 
 class GaussianSplat:
@@ -78,8 +105,7 @@ class GaussianSplat:
 
         W, H = cams[0].width, cams[0].height
         assert all((c.width, c.height) == (W, H) for c in cams), "mixed resolutions not supported yet"
-        images = torch.stack([torch.from_numpy(seq.image(c.name, self.frame)) for c in cams])
-        images = images.to(self.device).float() / 255.0                         # (V, H, W, 3)
+        images = torch.stack([torch.from_numpy(seq.image(c.name, self.frame)) for c in cams]).to(self.device)
         viewmats = torch.stack([self.viewmat(c) for c in cams])
         Ks = torch.tensor(np.stack([c.K for c in cams]), dtype=torch.float32, device=self.device)
 
@@ -91,6 +117,7 @@ class GaussianSplat:
         else:
             print("[3dgs] no triangulated points (scripts/triangulate_points.py); random init")
             self._init_gaussians(viewmats, Ks, W, H)
+        self.cam_names = [c.name for c in cams]
         self._train(images, viewmats, Ks, W, H)
         if ckpt:
             self.save(ckpt)
@@ -144,7 +171,12 @@ class GaussianSplat:
             torch.cat([p["sh0"], p["shN"]], 1), viewmats, Ks, W, H,
             sh_degree=sh_degree, packed=False, near_plane=0.01)
 
-    def _train(self, images, viewmats, Ks, W, H):
+    def _train(self, images, viewmats, Ks, W, H, cam_ids=None, masks=None):
+        """Optimize on M training images (uint8 (M, H, W, 3) on device).
+
+        cam_ids (M,) maps each image to its camera, so color transforms are shared across
+        frames; masks (M, H, W) bool restricts the loss (e.g. to static background).
+        """
         lrs = {"means": 1.6e-4, "scales": 5e-3, "quats": 1e-3, "opacities": 5e-2,
                "sh0": 2.5e-3, "shN": 2.5e-3 / 20}
         opts = {k: torch.optim.Adam([{"params": self.params[k], "lr": lr, "name": k}], eps=1e-15)
@@ -159,28 +191,24 @@ class GaussianSplat:
         # Per-training-camera affine color transform (identity init). Rig cameras differ in
         # exposure/white balance; without this, the Gaussians absorb those differences as
         # view-dependent floaters. Novel views render without it (shared color space).
-        V = len(images)
-        affine = torch.nn.Parameter(torch.eye(3, 4, device=self.device).repeat(V, 1, 1))
+        M = len(images)
+        cam_ids = torch.arange(M, device=self.device) if cam_ids is None else cam_ids
+        affine = torch.nn.Parameter(torch.eye(3, 4, device=self.device).repeat(int(cam_ids.max()) + 1, 1, 1))
         affine_opt = torch.optim.Adam([affine], lr=5e-4) if self.color_affine else None
 
         t0 = time.time()
-        order = torch.randperm(V)
+        order = torch.randperm(M)
         for step in range(self.iters):
-            i = int(order[step % V])
-            if step % V == V - 1:
-                order = torch.randperm(V)
+            i = int(order[step % M])
+            if step % M == M - 1:
+                order = torch.randperm(M)
             render, _, info = self._rasterize(viewmats[i:i + 1], Ks[i:i + 1], W, H,
                                               sh_degree=min(step // 1000, 3))
-            pred, gt = render[0], images[i]
+            pred, gt = render[0], images[i].float() / 255
             if affine_opt:
-                # Gauge fix: transforms are relative to their mean, so the shared color space is
-                # "the average camera" and cannot drift (e.g. darker scene + brighter transforms).
-                A = affine[i] - affine.mean(0) + torch.eye(3, 4, device=self.device)
-                pred = pred @ A[:, :3].T + A[:, 3]
+                pred = apply_affine(pred, gauge_fixed(affine)[cam_ids[i]])
             pred = pred.clamp(0, 1)
-            l1 = (pred - gt).abs().mean()
-            dssim = 1 - ssim(pred.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None])
-            loss = (0.8 * l1 + 0.2 * dssim
+            loss = (photometric_loss(pred, gt, None if masks is None else masks[i])
                     + 0.01 * torch.sigmoid(self.params["opacities"]).mean()
                     + 0.01 * torch.exp(self.params["scales"]).mean())
             strategy.step_pre_backward(self.params, opts, state, step, info)
@@ -193,8 +221,9 @@ class GaussianSplat:
 
             if step % 1000 == 0 or step == self.iters - 1:
                 psnr = -10 * torch.log10(((pred - gt) ** 2).mean()).item()
-                print(f"[3dgs] step {step:6d}  loss {loss.item():.4f}  train-psnr {psnr:5.2f}  "
+                print(f"[{self.name}] step {step:6d}  loss {loss.item():.4f}  train-psnr {psnr:5.2f}  "
                       f"gaussians {len(self.params['means']):,}  {time.time() - t0:6.0f}s", flush=True)
+        self.affine = gauge_fixed(affine).detach()
 
     # ---- render ------------------------------------------------------------------------
     @torch.no_grad()
@@ -209,12 +238,14 @@ class GaussianSplat:
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"params": {k: v.detach() for k, v in self.params.items()},
-                    "center": self.center, "scale": self.scale, "frame": self.frame}, path)
+                    "center": self.center, "scale": self.scale, "frame": self.frame,
+                    "affine": getattr(self, "affine", None), "cam_names": getattr(self, "cam_names", None)}, path)
 
     def load(self, path: Path) -> None:
         d = torch.load(path, map_location=self.device, weights_only=False)
         self.params = torch.nn.ParameterDict({k: torch.nn.Parameter(v) for k, v in d["params"].items()})
         self.center, self.scale, self.frame = d["center"], d["scale"], d["frame"]
+        self.affine, self.cam_names = d.get("affine"), d.get("cam_names")
 
     @torch.no_grad()
     def export_ply(self, path: Path) -> None:
