@@ -22,7 +22,7 @@ def main():
     ap.add_argument("--method", default="3dgs", choices=METHODS)
     ap.add_argument("--frame", type=int, help="frame for single-frame methods (must match a trained checkpoint)")
     ap.add_argument("--scale", type=float, default=0.5)
-    ap.add_argument("--n", type=int, default=240, help="path length in video frames (8 s at 30 fps)")
+    ap.add_argument("--n", type=int, default=300, help="path length in video frames (10 s at 30 fps)")
     ap.add_argument("--out", default="outputs/videos")
     args = ap.parse_args()
 
@@ -36,8 +36,11 @@ def main():
             f for f in seq.frame_ids if len(seq.valid_cameras(f)) == len(seq.camera_names))
         times = [frame] * args.n
     else:
-        times = [seq.frame_ids[k % len(seq.frame_ids)] for k in range(args.n)]
-    method.fit(seq, train_cams, sorted(set(times)))
+        # time plays forward then backward (ping-pong) while the camera orbits
+        fids = seq.frame_ids
+        cycle = fids + fids[-2:0:-1]
+        times = [cycle[k % len(cycle)] for k in range(args.n)]
+    method.fit(seq, train_cams, sorted(set(times)))  # dynamic methods track the whole range
 
     template = seq.camera(train_cams[0])
     path = orbit_path(seq, template, n=args.n)
