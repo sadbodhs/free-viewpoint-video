@@ -50,7 +50,8 @@ def load_or_create_split(seq: MultiViewSequence, n: int = 3) -> list[str]:
 def evaluate(method: NovelViewMethod, seq: MultiViewSequence, test_cams: list[str],
              frames: list[int], out_dir: str | Path, save_images: int = 3) -> dict:
     out = Path(out_dir) / method.name
-    shutil.rmtree(out / "images", ignore_errors=True)
+    for d in ("images", "pred"):
+        shutil.rmtree(out / d, ignore_errors=True)
     (out / "images").mkdir(parents=True)
     train_cams = [c for c in seq.camera_names if c not in test_cams]
     method.fit(seq, train_cams, frames)
@@ -64,12 +65,16 @@ def evaluate(method: NovelViewMethod, seq: MultiViewSequence, test_cams: list[st
                 pred = method.render(f, cam, timer)
             gt = seq.image(c, f)
             rows.append({"frame": f, "cam": c, **all_metrics(pred, gt)})
+            # every prediction is kept for the comparison video (scripts/make_comparison_video.py)
+            (out / "pred" / c).mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(out / "pred" / c / f"{f:08d}.jpg"), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR),
+                        [cv2.IMWRITE_JPEG_QUALITY, 92])
             if i < save_images:
                 side = np.concatenate([gt, pred], axis=1)
                 cv2.imwrite(str(out / "images" / f"{c}_{f:08d}.jpg"),
                             cv2.cvtColor(side, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
 
-    keys = ("psnr", "ssim", "lpips")
+    keys = ("psnr", "psnr_cc", "ssim", "lpips")
     result = {
         "method": method.name,
         "train_cams": train_cams,

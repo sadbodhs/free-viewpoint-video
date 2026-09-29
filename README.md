@@ -3,8 +3,8 @@
 Render a multi-camera recording from any virtual viewpoint, working toward real time.
 
 Roadmap:
-0. **Data layer + held-out-camera evaluation** ← current
-1. Offline 3D Gaussian Splatting quality baseline
+0. **Data layer + held-out-camera evaluation** ✓
+1. **Offline 3D Gaussian Splatting quality baseline** ← current
 2. Static background / dynamic foreground split
 3. Real-time GPU visual hull + view-dependent texturing
 4. Real-time neural rendering (feed-forward / temporal Gaussians)
@@ -38,12 +38,37 @@ scripts/run.sh python scripts/plot_rig.py data/panoptic/170221_haggling_b1
 scripts/run.sh python scripts/evaluate.py data/panoptic/170221_haggling_b1 --method nearest_view
 ```
 
+## Phase 1: Gaussian splatting (single frame)
+
+```bash
+# sparse points from the training cameras (COLMAP, known poses) -> <seq>/points/<frame>.ply
+scripts/run.sh python scripts/triangulate_points.py data/panoptic/170221_haggling_b1
+
+# train 3DGS on one frame + held-out eval; checkpoint and .ply in outputs/models/
+scripts/run.sh python scripts/evaluate.py data/panoptic/170221_haggling_b1 --method 3dgs
+```
+
+## Result videos
+
+Every method gets the same two videos:
+
+```bash
+# flythrough on the shared orbit path, with a rig mini-map (red = held-out cameras)
+scripts/run.sh python scripts/render_flythrough.py data/panoptic/170221_haggling_b1 --method 3dgs
+
+# held-out comparison grid: ground truth | method A | method B, per-frame PSNR
+scripts/run.sh python scripts/make_comparison_video.py data/panoptic/170221_haggling_b1 \
+    --methods nearest_view 3dgs
+```
+
 ## Layout
 
 ```
 fvv/data/     Camera, MultiViewSequence (dataset-agnostic on-disk format, see sequence.py)
 fvv/eval/     PSNR/SSIM/LPIPS, held-out-camera protocol, per-stage latency timer
 fvv/methods/  novel-view methods (fit + render interface in fvv/eval/protocol.py)
+fvv/geometry/ COLMAP triangulation with known poses
+fvv/render/   shared virtual camera paths, video writer, overlays
 scripts/      dataset download, checks, evaluation
 docker/       Dockerfile + requirements
 ```

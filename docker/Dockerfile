@@ -23,4 +23,12 @@ RUN uv pip install torch torchvision --index-url https://download.pytorch.org/wh
 COPY docker/requirements.txt /tmp/requirements.txt
 RUN uv pip install -r /tmp/requirements.txt
 
+# gsplat built from source so its CUDA kernels are compiled into the image (no JIT at runtime).
+RUN uv pip install setuptools wheel ninja \
+    && MAX_JOBS=8 uv pip install --no-build-isolation --no-binary gsplat "gsplat>=1.5"
+
+# COLMAP: triangulate initial points from calibrated cameras (CPU SIFT is fine for ~30 views).
+RUN apt-get update && apt-get install -y --no-install-recommends colmap \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /workspace

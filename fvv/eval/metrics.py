@@ -14,6 +14,19 @@ def psnr(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray | None = None) -> fl
     return float("inf") if mse == 0 else float(-10 * np.log10(mse))
 
 
+def color_correct(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
+    """Best affine color transform (3x4, least squares) mapping pred onto gt.
+
+    Cameras in a rig are rarely color-matched; a novel view cannot know the held-out camera's
+    exposure/white balance. PSNR after this correction isolates geometry/texture errors.
+    """
+    x = pred.reshape(-1, 3).astype(np.float64) / 255
+    y = gt.reshape(-1, 3).astype(np.float64) / 255
+    X = np.concatenate([x, np.ones((len(x), 1))], 1)
+    A, *_ = np.linalg.lstsq(X, y, rcond=None)
+    return (np.clip(X @ A, 0, 1) * 255).round().astype(np.uint8).reshape(pred.shape)
+
+
 def ssim(pred: np.ndarray, gt: np.ndarray) -> float:
     return float(structural_similarity(pred, gt, channel_axis=2, data_range=255))
 
@@ -29,4 +42,5 @@ def lpips(pred: np.ndarray, gt: np.ndarray, device: str = "cuda") -> float:
 
 
 def all_metrics(pred: np.ndarray, gt: np.ndarray) -> dict[str, float]:
-    return {"psnr": psnr(pred, gt), "ssim": ssim(pred, gt), "lpips": lpips(pred, gt)}
+    return {"psnr": psnr(pred, gt), "psnr_cc": psnr(color_correct(pred, gt), gt),
+            "ssim": ssim(pred, gt), "lpips": lpips(pred, gt)}
