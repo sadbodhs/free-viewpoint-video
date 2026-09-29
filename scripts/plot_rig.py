@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from fvv.data import MultiViewSequence
-from fvv.eval import pick_test_cameras
+from fvv.eval import load_or_create_split
 
 
 def main():
@@ -18,12 +18,12 @@ def main():
     args = ap.parse_args()
 
     seq = MultiViewSequence(args.root)
-    test = set(pick_test_cameras(seq))
+    test = set(load_or_create_split(seq))
     names = seq.camera_names
     C = np.stack([seq.cameras[n].center for n in names])
     F = np.stack([seq.cameras[n].forward for n in names])
     bodies = seq.bodies(seq.frame_ids[0])
-    J = np.concatenate([b["joints"][:, :3] for b in bodies]) if bodies else np.zeros((0, 3))
+    J = np.concatenate([b["joints"][b["joints"][:, 3] > 0, :3] for b in bodies]) if bodies else np.zeros((0, 3))
 
     # Panoptic: y points down, floor is the x-z plane.
     fig, axes = plt.subplots(1, 2, figsize=(14, 6.5))

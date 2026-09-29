@@ -4,6 +4,7 @@ A method sees only the training cameras and must render the held-out cameras'
 viewpoints; the real held-out images are the ground truth.
 """
 import json
+import shutil
 from pathlib import Path
 from typing import Protocol
 
@@ -36,17 +37,28 @@ def pick_test_cameras(seq: MultiViewSequence, n: int = 3) -> list[str]:
     return sorted(names[i] for i in chosen)
 
 
+def load_or_create_split(seq: MultiViewSequence, n: int = 3) -> list[str]:
+    """Held-out cameras are fixed per sequence (saved in split.json) so results stay comparable."""
+    path = seq.root / "split.json"
+    if path.exists():
+        return json.loads(path.read_text())["test_cams"]
+    test = pick_test_cameras(seq, n)
+    path.write_text(json.dumps({"test_cams": test}))
+    return test
+
+
 def evaluate(method: NovelViewMethod, seq: MultiViewSequence, test_cams: list[str],
              frames: list[int], out_dir: str | Path, save_images: int = 3) -> dict:
     out = Path(out_dir) / method.name
-    (out / "images").mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(out / "images", ignore_errors=True)
+    (out / "images").mkdir(parents=True)
     train_cams = [c for c in seq.camera_names if c not in test_cams]
     method.fit(seq, train_cams, frames)
 
     timer = StageTimer()
     rows = []
     for i, f in enumerate(frames):
-        for c in test_cams:
+        for c in seq.valid_cameras(f, test_cams):
             cam = seq.camera(c)
             with timer("total"):
                 pred = method.render(f, cam, timer)

@@ -6,6 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     TORCH_CUDA_ARCH_LIST="8.6" \
     UV_LINK_MODE=copy \
+    UV_NO_CACHE=1 \
     UV_PYTHON_INSTALL_DIR=/opt/python \
     VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH

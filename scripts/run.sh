@@ -11,6 +11,7 @@ mkdir -p .cache/home .cache/torch
 exec docker run --rm "${TTY[@]}" --gpus all --ipc=host \
     --user "$(id -u):$(id -g)" \
     -e HOME=/workspace/.cache/home \
+    -e USER="$(id -un)" \
     -e TORCH_HOME=/workspace/.cache/torch \
     -e PYTHONPATH=/workspace \
     -v "$PWD":/workspace -w /workspace \

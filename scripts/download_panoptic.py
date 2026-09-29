@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
-from fvv.data import Camera, save_cameras
+from fvv.data import Camera, MultiViewSequence, save_cameras
 
 BASE = "http://domedb.perception.cs.cmu.edu/webdata/dataset"
 HD_FPS = 30000 / 1001
@@ -118,6 +118,16 @@ def main():
                           root / "frames" / c.name, args.scale) for c in cams]
         for j in tqdm(jobs, desc="cameras"):
             tqdm.write(j.result())
+
+    # Panoptic fills missing footage with solid green: drop mostly-blank cameras, mark the rest per frame.
+    blank = MultiViewSequence(root, cams=[c.name for c in cams]).scan_blank_frames()
+    excluded = {c: f"{len(f)}/{args.num_frames} frames blank" for c, f in blank.items()
+                if len(f) > args.num_frames / 2}
+    invalid = {c: f for c, f in blank.items() if c not in excluded}
+    (root / "excluded_cameras.json").write_text(json.dumps(excluded, indent=1))
+    (root / "invalid_frames.json").write_text(json.dumps(invalid))
+    print(f"excluded cameras: {excluded or 'none'}")
+    print(f"dropped frames: {({c: len(f) for c, f in invalid.items()}) or 'none'}")
 
 
 if __name__ == "__main__":

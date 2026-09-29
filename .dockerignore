@@ -1,4 +1,4 @@
-data
-outputs
-.cache
+/data
+/outputs
+/.cache
 .git

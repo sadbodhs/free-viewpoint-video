@@ -1,5 +1,5 @@
 numpy<2.3
-opencv-python-headless
+opencv-python-headless<5
 scipy
 scikit-image
 lpips
