@@ -14,7 +14,8 @@ Roadmap:
 8. Generalization: uncalibrated/moving cameras, sparse views
 
 How the offline phases turn into a live system (latency budget, milestones R0–R6):
-[docs/REALTIME.md](docs/REALTIME.md).
+[docs/REALTIME.md](docs/REALTIME.md). Efficiency/accuracy study and plan:
+[docs/OPTIMIZATION.md](docs/OPTIMIZATION.md).
 
 ## Environment
 
