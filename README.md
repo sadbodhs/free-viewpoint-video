@@ -70,6 +70,18 @@ scripts/run.sh python scripts/live_replay.py data/panoptic/170221_haggling_b1 --
     --faults "jitter=40,drop=00_05@1-3,freeze=00_07@2-3,blur=00_03@0.5-4,corrupt=00_10@1.5,res=00_04@2x0.5"
 ```
 
+## Live viewer (local network)
+
+```bash
+scripts/serve.sh data/panoptic/170221_haggling_b1     # then open http://<gpu-machine-ip>:8080
+docker stop fvv-serve
+```
+
+Drag to orbit, scroll to move, shift+scroll / pinch to zoom (capped at the cameras' resolution),
+play/pause and scrub time, switch between **live** (replayed feeds → visual hull every frame)
+and **layered** (precomputed offline quality), and toggle camera fault injection. The strip under
+the view is per-camera health for the current frame.
+
 ## Result videos
 
 Every method gets the same two videos:

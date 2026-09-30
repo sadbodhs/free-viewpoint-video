@@ -31,4 +31,7 @@ RUN uv pip install setuptools wheel ninja \
 RUN apt-get update && apt-get install -y --no-install-recommends colmap \
     && rm -rf /var/lib/apt/lists/*
 
+# Live viewer web server (scripts/serve.py).
+RUN uv pip install "aiohttp>=3.9"
+
 WORKDIR /workspace

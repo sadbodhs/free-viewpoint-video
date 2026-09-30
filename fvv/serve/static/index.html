@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Free-Viewpoint Live</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --text: #e8eaf0; --muted: #9aa3b2; --accent: #f5c542;
+    --ok: #3cc85a; --late: #ffc828; --missing: #e63232; --corrupt: #c83cc8; --frozen: #ff8c00;
+    --blank: #787878; --blur: #ff6ea0; --resized: #5aaaff; --border: #2a2f3a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, -apple-system, sans-serif; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 12px 16px; }
+  header h1 { font-size: 16px; margin: 0; }
+  header .conn { color: var(--muted); font-size: 12px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 12px; padding: 0 16px 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .stage { position: relative; background: #000; border-radius: 8px; overflow: hidden; touch-action: none;
+           cursor: grab; aspect-ratio: 16 / 9; }
+  .stage:active { cursor: grabbing; }
+  canvas { width: 100%; height: 100%; display: block; }
+  .hud { position: absolute; left: 8px; top: 8px; padding: 4px 8px; background: rgba(0,0,0,.55);
+         border-radius: 4px; font: 12px ui-monospace, monospace; pointer-events: none; }
+  .warn { color: var(--accent); }
+  .health { display: grid; gap: 2px; margin-top: 6px; }
+  .health span { height: 12px; border-radius: 2px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 12px 0 6px; }
+  .panel h2:first-child { margin-top: 0; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+  button, select { background: #222734; color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+                   padding: 6px 10px; font: inherit; cursor: pointer; }
+  button:hover, select:hover { border-color: var(--muted); }
+  input[type=range] { width: 100%; }
+  .stats { font: 12px ui-monospace, monospace; color: var(--muted); white-space: pre; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 10px; font-size: 11px; color: var(--muted); }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  .help { font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header><h1>Free-Viewpoint Live</h1><span class="conn" id="conn">connecting…</span></header>
+<main>
+  <div>
+    <div class="stage" id="stage">
+      <canvas id="view" width="960" height="540"></canvas>
+      <div class="hud" id="hud"></div>
+    </div>
+    <div class="health" id="health"></div>
+  </div>
+  <div class="panel">
+    <h2>Playback</h2>
+    <div class="row"><button id="play">Pause</button><button id="reset">Reset view</button></div>
+    <input type="range" id="time" min="0" max="149" value="0">
+    <h2>Mode</h2>
+    <div class="row"><select id="mode"></select></div>
+    <div class="row"><label><input type="checkbox" id="faults"> Inject camera faults</label></div>
+    <h2>Stats</h2>
+    <div class="stats" id="stats"></div>
+    <h2>Camera health</h2>
+    <div class="legend" id="legend"></div>
+    <h2>Controls</h2>
+    <div class="help">Drag to orbit · scroll to move closer · shift+scroll (or pinch) to zoom ·
+      keys ←/→ step frames, space play/pause</div>
+  </div>
+</main>
+<script>
+const COLORS = {ok: "var(--ok)", late: "var(--late)", missing: "var(--missing)", corrupt: "var(--corrupt)",
+                frozen: "var(--frozen)", blank: "var(--blank)", blur: "var(--blur)", resized: "var(--resized)"};
+const $ = id => document.getElementById(id);
+const canvas = $("view"), ctx = canvas.getContext("2d");
+const pose = {az: 30, el: 25, dist: 250, zoom: 1};
+let ws, init = null, playing = true, frameTimes = [], dirty = true, lastHeader = null;
+
+$("legend").innerHTML = Object.entries(COLORS).map(([k, c]) => `<span><i style="background:${c}"></i>${k}</span>`).join("");
+
+function connect() {
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => $("conn").textContent = "connected";
+  ws.onclose = () => { $("conn").textContent = "disconnected — retrying…"; setTimeout(connect, 1000); };
+  ws.onmessage = async ev => {
+    if (typeof ev.data === "string") {
+      const m = JSON.parse(ev.data);
+      if (m.type === "init") {
+        init = m;
+        Object.assign(pose, m.viewer);
+        $("time").max = m.frames - 1;
+        $("mode").innerHTML = m.modes.map(x => `<option value="${x}">${x === "live" ? "live (visual hull)" : x + " (offline quality)"}</option>`).join("");
+        $("mode").value = m.mode;
+        $("health").style.gridTemplateColumns = `repeat(${m.cams.length}, 1fr)`;
+        dirty = true;
+      }
+      return;
+    }
+    const buf = new DataView(ev.data);
+    const n = buf.getUint32(0, true);
+    const header = JSON.parse(new TextDecoder().decode(new Uint8Array(ev.data, 4, n)));
+    const bmp = await createImageBitmap(new Blob([new Uint8Array(ev.data, 4 + n)], {type: "image/jpeg"}));
+    ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    show(header);
+  };
+}
+
+function show(h) {
+  lastHeader = h;
+  const now = performance.now();
+  frameTimes.push(now);
+  while (frameTimes.length && now - frameTimes[0] > 1000) frameTimes.shift();
+  if (!$("time").matches(":active")) $("time").value = h.slot;
+  playing = h.playing;
+  $("play").textContent = playing ? "Pause" : "Play";
+  $("faults").checked = h.faults;
+  if (document.activeElement !== $("mode")) $("mode").value = h.mode;
+  const lim = [h.zoom_limited ? "zoom capped at camera resolution" : "", h.dist_limited ? "kept inside the camera rig" : ""]
+    .filter(Boolean).join(" · ");
+  $("hud").innerHTML = `${h.mode} · frame ${h.frame} · ${h.cams_ok}/${h.cams_total} cams` + (lim ? `<br><span class="warn">${lim}</span>` : "");
+  $("stats").textContent =
+    `received fps  ${frameTimes.length}\nprocess       ${h.process_ms} ms\nrender        ${h.render_ms} ms\n` +
+    `distance      ${h.dist} cm\nzoom          ${h.zoom}x`;
+  $("health").innerHTML = h.status.map((s, i) => `<span title="${init ? init.cams[i] : i}: ${s}" style="background:${COLORS[s]}"></span>`).join("");
+}
+
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+function sendPose() { if (dirty) { send({type: "pose", ...pose}); dirty = false; } requestAnimationFrame(sendPose); }
+requestAnimationFrame(sendPose);
+
+// orbit controls: mouse + touch (pointer events), pinch to zoom
+const stage = $("stage"), pointers = new Map();
+let pinch0 = null;
+stage.addEventListener("pointerdown", e => { stage.setPointerCapture(e.pointerId); pointers.set(e.pointerId, [e.clientX, e.clientY]); });
+stage.addEventListener("pointerup", e => { pointers.delete(e.pointerId); pinch0 = null; });
+stage.addEventListener("pointercancel", e => { pointers.delete(e.pointerId); pinch0 = null; });
+stage.addEventListener("pointermove", e => {
+  if (!pointers.has(e.pointerId)) return;
+  const [px, py] = pointers.get(e.pointerId);
+  pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+    if (pinch0) pose.zoom = Math.max(0.5, Math.min(6, pose.zoom * d / pinch0));
+    pinch0 = d;
+  } else {
+    pose.az -= (e.clientX - px) * 0.3;
+    pose.el = Math.max(-5, Math.min(80, pose.el + (e.clientY - py) * 0.2));
+  }
+  dirty = true;
+});
+stage.addEventListener("wheel", e => {
+  e.preventDefault();
+  if (e.shiftKey) pose.zoom = Math.max(0.5, Math.min(6, pose.zoom * Math.exp(-e.deltaY * 0.0015)));
+  else pose.dist = Math.max(80, Math.min(600, pose.dist * Math.exp(e.deltaY * 0.001)));
+  dirty = true;
+}, {passive: false});
+
+$("play").onclick = () => send({type: "control", playing: !playing});
+$("reset").onclick = () => { if (init) Object.assign(pose, init.viewer); dirty = true; };
+$("time").oninput = e => send({type: "control", seek: +e.target.value, playing: false});
+$("mode").onchange = e => send({type: "control", mode: e.target.value});
+$("faults").onchange = e => send({type: "control", faults: e.target.checked});
+document.addEventListener("keydown", e => {
+  if (!lastHeader) return;
+  if (e.key === " ") { e.preventDefault(); send({type: "control", playing: !playing}); }
+  if (e.key === "ArrowRight") send({type: "control", seek: lastHeader.slot + 1, playing: false});
+  if (e.key === "ArrowLeft") send({type: "control", seek: lastHeader.slot - 1, playing: false});
+});
+connect();
+</script>
+</body>
+</html>
