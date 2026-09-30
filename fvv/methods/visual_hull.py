@@ -109,6 +109,8 @@ class VisualHull:
     def process(self, images: dict, timer: StageTimer) -> dict:
         """images: cam -> RGB uint8 (H, W, 3), numpy or GPU tensor (live ingest decodes to GPU)."""
         cams = [c for c in images if c in self.cams]
+        if not cams:                       # every feed lost this slot: background only
+            return {"cams": [], "images": None, "voxels": torch.zeros(0, 3, device=self.device)}
         with timer("upload"):
             u8 = torch.stack([torch.as_tensor(images[c]).to(self.device, non_blocking=True) for c in cams])
         with timer("masks"):
@@ -126,6 +128,40 @@ class VisualHull:
             fine = fine[self._carve(fine, P, fine_m)]
         return {"cams": cams, "images": imgs, "voxels": fine}
 
+    def _colorize(self, x, q, s, cams, images, camera: Camera):
+        """View-dependent voxel colors from the real cameras nearest the virtual view (occlusion-tested)."""
+        n, dev = len(x), self.device
+        ctr = torch.tensor(self.bg.center, dtype=torch.float32, device=dev)
+        vc = (torch.tensor(camera.center, dtype=torch.float32, device=dev) - ctr) / self.bg.scale
+        target = x.mean(0) if n else torch.zeros(3, device=dev)
+        vdir = F.normalize(target - vc, dim=0)
+        centers = (torch.tensor(np.stack([self.cams[c].center for c in cams]), dtype=torch.float32,
+                                device=dev) - ctr) / self.bg.scale
+        cos = F.normalize(target - centers, dim=1) @ vdir
+        sel = cos.topk(min(self.k, len(cams))).indices.tolist()
+        chosen = [cams[i] for i in sel]
+        W, H = self.cams[chosen[0]].width, self.cams[chosen[0]].height
+        # one multi-camera depth render of the hull for occlusion tests
+        depth, _, _ = rasterization(x, q, s, torch.full((n,), 0.99, device=dev), torch.zeros(n, 3, device=dev),
+                                    torch.stack([self.viewmats[c] for c in chosen]),
+                                    torch.stack([self.Ks[c] for c in chosen]), W, H,
+                                    render_mode="ED", packed=False)
+        rgb = torch.zeros(n, 3, device=dev)
+        wsum = torch.zeros(n, device=dev)
+        for j, (i, c) in enumerate(zip(sel, chosen)):
+            uv, z = self._project(c, x)
+            ui = uv[:, 0].long().clamp(0, W - 1)
+            vi = uv[:, 1].long().clamp(0, H - 1)
+            visible = (z > 0) & (z <= depth[j, vi, ui, 0] + 2 * self.fine_n)
+            M, b = self.to_canon[c]
+            col = (images[i][vi, ui] - b) @ M.T
+            w = visible.float() * (float(cos[i]) + 1.01) ** 8
+            rgb += col * w[:, None]
+            wsum += w
+        rgb = (rgb / wsum.clamp(min=1e-6)[:, None]).clamp(0, 1)
+        opac = torch.where(wsum > 0, 0.99, 0.0)
+        return rgb, opac
+
     @torch.no_grad()
     def render_view(self, state: dict, camera: Camera, timer: StageTimer) -> np.ndarray:
         x, cams, images = state["voxels"], state["cams"], state["images"]
@@ -135,35 +171,10 @@ class VisualHull:
         q = torch.zeros(n, 4, device=dev)
         q[:, 0] = 1
         with timer("color"):
-            ctr = torch.tensor(self.bg.center, dtype=torch.float32, device=dev)
-            vc = (torch.tensor(camera.center, dtype=torch.float32, device=dev) - ctr) / self.bg.scale
-            target = x.mean(0) if n else torch.zeros(3, device=dev)
-            vdir = F.normalize(target - vc, dim=0)
-            centers = (torch.tensor(np.stack([self.cams[c].center for c in cams]), dtype=torch.float32,
-                                    device=dev) - ctr) / self.bg.scale
-            cos = F.normalize(target - centers, dim=1) @ vdir
-            sel = cos.topk(min(self.k, len(cams))).indices.tolist()
-            chosen = [cams[i] for i in sel]
-            W, H = self.cams[chosen[0]].width, self.cams[chosen[0]].height
-            # one multi-camera depth render of the hull for occlusion tests
-            depth, _, _ = rasterization(x, q, s, torch.full((n,), 0.99, device=dev), torch.zeros(n, 3, device=dev),
-                                        torch.stack([self.viewmats[c] for c in chosen]),
-                                        torch.stack([self.Ks[c] for c in chosen]), W, H,
-                                        render_mode="ED", packed=False)
-            rgb = torch.zeros(n, 3, device=dev)
-            wsum = torch.zeros(n, device=dev)
-            for j, (i, c) in enumerate(zip(sel, chosen)):
-                uv, z = self._project(c, x)
-                ui = uv[:, 0].long().clamp(0, W - 1)
-                vi = uv[:, 1].long().clamp(0, H - 1)
-                visible = (z > 0) & (z <= depth[j, vi, ui, 0] + 2 * self.fine_n)
-                M, b = self.to_canon[c]
-                col = (images[i][vi, ui] - b) @ M.T
-                w = visible.float() * (float(cos[i]) + 1.01) ** 8
-                rgb += col * w[:, None]
-                wsum += w
-            rgb = (rgb / wsum.clamp(min=1e-6)[:, None]).clamp(0, 1)
-            opac = torch.where(wsum > 0, 0.99, 0.0)
+            if n and cams:
+                rgb, opac = self._colorize(x, q, s, cams, images, camera)
+            else:                          # no people / no feeds: background only
+                rgb, opac = torch.zeros(0, 3, device=dev), torch.zeros(0, device=dev)
         with timer("rasterize"):
             bg = self.bg.params
             K = torch.tensor(camera.K, dtype=torch.float32, device=dev)[None]

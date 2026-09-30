@@ -95,7 +95,7 @@ class Synchronizer:
     def __init__(self, cams: list[str], expected_size: dict[str, tuple[int, int]], fps: float = 30.0,
                  buffer_ms: float = 100.0):
         self.cams, self.expected, self.fps, self.buffer = cams, expected_size, fps, buffer_ms / 1000
-        self.last_small: dict[str, torch.Tensor] = {}
+        self.last_small: dict[str, tuple[int, torch.Tensor]] = {}   # cam -> (slot, thumbnail)
         self.sharp_ref: dict[str, float] = {}
         self.lap = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)[None, None]
 
@@ -109,12 +109,12 @@ class Synchronizer:
             if p.decode_error or p.image is None:
                 fs.status[p.cam] = "corrupt" if p.decode_error else "missing"
                 continue
-            fs.status[p.cam], img = self._health(p)
+            fs.status[p.cam], img = self._health(p, k)
             if img is not None:
                 fs.images[p.cam] = img
         return fs
 
-    def _health(self, p: Packet) -> tuple[str, torch.Tensor | None]:
+    def _health(self, p: Packet, k: int) -> tuple[str, torch.Tensor | None]:
         img = p.image
         W, H = self.expected[p.cam]
         status = "ok"
@@ -125,9 +125,10 @@ class Synchronizer:
         small = F.interpolate(_hwc_to_chw(img)[None], size=(H // 8, W // 8), mode="area")[0]
         if small.reshape(3, -1).std(1).max().item() < 8:
             return "blank", None
+        # frozen = identical image for a *new* slot (re-reading the same slot, e.g. while paused, is fine)
         prev = self.last_small.get(p.cam)
-        self.last_small[p.cam] = small
-        if prev is not None and torch.equal(prev, small):
+        self.last_small[p.cam] = (k, small)
+        if prev is not None and prev[0] != k and torch.equal(prev[1], small):
             return "frozen", None
         gray = small.mean(0)[None, None]
         sharp = F.conv2d(gray, self.lap.to(gray.device)).var().item()

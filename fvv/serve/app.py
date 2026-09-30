@@ -61,7 +61,13 @@ def make_app(engine: Engine) -> web.Application:
                 if msg.type != WSMsgType.TEXT:
                     continue
                 m = json.loads(msg.data)
-                if m.get("type") == "pose":
+                if m.get("type") == "pick":
+                    viewer.pick = (float(m["u"]), float(m["v"]))
+                elif m.get("type") == "follow":
+                    viewer.follow = m["follow"] if m["follow"] in ("group", "person", "off") else "group"
+                    if viewer.follow != "person":
+                        viewer.person = None
+                elif m.get("type") == "pose":
                     for k in ("az", "el", "dist", "zoom", "quality"):
                         if k in m:
                             setattr(viewer, k, float(m[k]))
@@ -70,10 +76,11 @@ def make_app(engine: Engine) -> web.Application:
                         engine.playing = bool(m["playing"])
                     if "seek" in m:
                         engine.seek(int(m["seek"]))
-                    if m.get("mode") in engine.methods:
-                        engine.mode = m["mode"]
+                    if "mode" in m:
+                        engine.set_mode(m["mode"])
                     if "faults" in m:
                         engine.set_faults(bool(m["faults"]))
+
         finally:
             task.cancel()
             with engine.lock:

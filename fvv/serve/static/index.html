@@ -53,17 +53,25 @@
   <div class="panel">
     <h2>Playback</h2>
     <div class="row"><button id="play">Pause</button><button id="reset">Reset view</button></div>
+    <h2>Zoom</h2>
+    <div class="row"><button id="zin">+</button><button id="zout">−</button><span class="stats" id="zoomval"></span></div>
     <input type="range" id="time" min="0" max="149" value="0">
     <h2>Mode</h2>
     <div class="row"><select id="mode"></select></div>
+    <h2>Follow</h2>
+    <div class="row"><select id="follow">
+      <option value="group">whole group</option><option value="person">selected person</option><option value="off">off (fixed point)</option>
+    </select></div>
+    <div class="help">Double-click a person to follow them.</div>
     <div class="row"><label><input type="checkbox" id="faults"> Inject camera faults</label></div>
     <h2>Stats</h2>
     <div class="stats" id="stats"></div>
     <h2>Camera health</h2>
     <div class="legend" id="legend"></div>
     <h2>Controls</h2>
-    <div class="help">Drag to orbit · scroll to move closer · shift+scroll (or pinch) to zoom ·
-      keys ←/→ step frames, space play/pause</div>
+    <div class="help">Drag to orbit · mouse wheel / pinch / + − to zoom (moves closer, then optical
+      zoom up to the cameras' resolution) · double-click a person to follow them ·
+      ←/→ step frames · space play/pause</div>
   </div>
 </main>
 <script>
@@ -73,6 +81,7 @@ const $ = id => document.getElementById(id);
 const canvas = $("view"), ctx = canvas.getContext("2d");
 const pose = {az: 30, el: 25, dist: 250, zoom: 1};
 let ws, init = null, playing = true, frameTimes = [], dirty = true, lastHeader = null;
+let maxDist = 600, maxZoom = 6;
 
 $("legend").innerHTML = Object.entries(COLORS).map(([k, c]) => `<span><i style="background:${c}"></i>${k}</span>`).join("");
 
@@ -106,6 +115,11 @@ function connect() {
 
 function show(h) {
   lastHeader = h;
+  // adopt the server's limits so scrolling never has a dead zone
+  if (h.dist_limited && pose.dist > h.dist) { pose.dist = h.dist; maxDist = h.dist; }
+  else if (!h.dist_limited) maxDist = 600;          // limit depends on orbit direction: let the server clamp
+  if (h.zoom_limited) { pose.zoom = h.zoom; maxZoom = h.zoom; } else maxZoom = 6;
+  $("zoomval").textContent = `${Math.round(h.dist)} cm · ${h.zoom.toFixed(2)}x`;
   const now = performance.now();
   frameTimes.push(now);
   while (frameTimes.length && now - frameTimes[0] > 1000) frameTimes.shift();
@@ -113,10 +127,13 @@ function show(h) {
   playing = h.playing;
   $("play").textContent = playing ? "Pause" : "Play";
   $("faults").checked = h.faults;
+  if (document.activeElement !== $("follow")) $("follow").value = h.follow;
   if (document.activeElement !== $("mode")) $("mode").value = h.mode;
-  const lim = [h.zoom_limited ? "zoom capped at camera resolution" : "", h.dist_limited ? "kept inside the camera rig" : ""]
+  const lim = [h.zoom_limited ? "max zoom reached" : (h.beyond_source ? "beyond camera resolution: softer" : ""),
+               h.dist_limited ? "kept inside the camera rig" : ""]
     .filter(Boolean).join(" · ");
-  $("hud").innerHTML = `${h.mode} · frame ${h.frame} · ${h.cams_ok}/${h.cams_total} cams` + (lim ? `<br><span class="warn">${lim}</span>` : "");
+  const fol = h.follow === "person" ? " · following person" : h.follow === "group" ? ` · following ${h.people} people` : "";
+  $("hud").innerHTML = `${h.mode} · frame ${h.frame} · ${h.cams_ok}/${h.cams_total} cams${fol}` + (lim ? `<br><span class="warn">${lim}</span>` : "");
   $("stats").textContent =
     `received fps  ${frameTimes.length}\nprocess       ${h.process_ms} ms\nrender        ${h.render_ms} ms\n` +
     `distance      ${h.dist} cm\nzoom          ${h.zoom}x`;
@@ -140,7 +157,7 @@ stage.addEventListener("pointermove", e => {
   if (pointers.size === 2) {
     const [a, b] = [...pointers.values()];
     const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
-    if (pinch0) pose.zoom = Math.max(0.5, Math.min(6, pose.zoom * d / pinch0));
+    if (pinch0) zoomBy(Math.log(d / pinch0) / 0.25);
     pinch0 = d;
   } else {
     pose.az -= (e.clientX - px) * 0.3;
@@ -148,23 +165,46 @@ stage.addEventListener("pointermove", e => {
   }
   dirty = true;
 });
-stage.addEventListener("wheel", e => {
-  e.preventDefault();
-  if (e.shiftKey) pose.zoom = Math.max(0.5, Math.min(6, pose.zoom * Math.exp(-e.deltaY * 0.0015)));
-  else pose.dist = Math.max(80, Math.min(600, pose.dist * Math.exp(e.deltaY * 0.001)));
+// Zoom = one control: move closer down to NEAR, then optical zoom (capped by the server at the
+// cameras' resolution); zooming out undoes optical zoom first, then moves back to the rig edge.
+const NEAR = 80;
+function zoomBy(steps) {                 // steps > 0 = in
+  const f = Math.exp(0.25 * Math.abs(steps));
+  if (steps > 0) {
+    if (pose.dist > NEAR) pose.dist = Math.max(NEAR, pose.dist / f);
+    else pose.zoom = Math.min(maxZoom, pose.zoom * f);
+  } else {
+    if (pose.zoom > 1) pose.zoom = Math.max(1, pose.zoom / f);
+    else pose.dist = Math.min(maxDist, pose.dist * f);
+  }
   dirty = true;
+}
+stage.addEventListener("wheel", e => {
+  e.preventDefault();                    // also stops the browser's own page zoom (ctrl+wheel / pinch)
+  const d = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+  const unit = e.deltaMode === 1 ? 1 : 1 / 40;          // lines vs pixels (mouse wheel vs trackpad)
+  zoomBy(-d * unit * (e.ctrlKey ? 2 : 1));
 }, {passive: false});
 
 $("play").onclick = () => send({type: "control", playing: !playing});
-$("reset").onclick = () => { if (init) Object.assign(pose, init.viewer); dirty = true; };
+$("zin").onclick = () => zoomBy(3);
+$("zout").onclick = () => zoomBy(-3);
+$("reset").onclick = () => { if (init) Object.assign(pose, init.viewer); maxDist = 600; maxZoom = 6; dirty = true; };
 $("time").oninput = e => send({type: "control", seek: +e.target.value, playing: false});
 $("mode").onchange = e => send({type: "control", mode: e.target.value});
 $("faults").onchange = e => send({type: "control", faults: e.target.checked});
+$("follow").onchange = e => send({type: "follow", follow: e.target.value});
+stage.addEventListener("dblclick", e => {
+  const r = canvas.getBoundingClientRect();
+  send({type: "pick", u: (e.clientX - r.left) / r.width, v: (e.clientY - r.top) / r.height});
+});
 document.addEventListener("keydown", e => {
   if (!lastHeader) return;
   if (e.key === " ") { e.preventDefault(); send({type: "control", playing: !playing}); }
   if (e.key === "ArrowRight") send({type: "control", seek: lastHeader.slot + 1, playing: false});
   if (e.key === "ArrowLeft") send({type: "control", seek: lastHeader.slot - 1, playing: false});
+  if (e.key === "+" || e.key === "=") zoomBy(3);
+  if (e.key === "-" || e.key === "_") zoomBy(-3);
 });
 connect();
 </script>
