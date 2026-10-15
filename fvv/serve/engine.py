@@ -9,8 +9,8 @@ import time
 import traceback
 from dataclasses import dataclass
 
-import cv2
 import numpy as np
+from torchvision.io import encode_jpeg
 from scipy import ndimage
 
 from fvv.data import Camera, MultiViewSequence
@@ -34,6 +34,7 @@ class Viewer:
     person: np.ndarray | None = None      # tracked person position when follow == "person"
     pick: tuple[float, float] | None = None   # pending double-click (u, v in 0..1)
     send: object = None                   # callable(bytes header_json, bytes jpeg), set by the web layer
+    last_key: tuple | None = None         # what the last sent frame showed (skip identical re-renders)
 
 
 class Engine:
@@ -65,6 +66,7 @@ class Engine:
         self.template = seq.camera(cams[0])
         self.home = self.target.copy()
         self.state, self.fs, self.last_process_ms = None, None, 0.0
+        self.version = 0                  # bumps whenever the shared per-frame state is recomputed
         self.pending: dict = {}
 
     # ---- viewer camera with limits -------------------------------------------------------
@@ -212,6 +214,7 @@ class Engine:
                 self.state = self.methods["live"].process(self.fs.images, timer)
             else:
                 self.state = "offline"
+            self.version += 1
             self.last_process_ms = (time.perf_counter() - t0) * 1000
 
         with self.lock:
@@ -223,14 +226,17 @@ class Engine:
             if v.pick is not None:
                 self._pick(v, self.camera(v)[0], people)
             self._update_target(v, people)
+            key = (v.az, v.el, v.dist, v.zoom, v.quality, tuple(np.round(v.target, 1)), self.mode, self.version)
+            if key == v.last_key:          # paused and not moving: nothing new to show, skip the work
+                continue
+            v.last_key = key
             cam, info = self.camera(v)
             if self.mode == "live":
-                img = self.methods["live"].render_view(self.state, cam, timer)
+                img = self.methods["live"].render_view(self.state, cam, timer, as_tensor=True)
             else:
-                img = self.methods[self.mode].render(frame, cam, timer)
+                img = self.methods[self.mode].render(frame, cam, timer, as_tensor=True)
+            jpg = encode_jpeg(img.permute(2, 0, 1).contiguous(), quality=int(v.quality)).cpu().numpy()
             render_ms = (time.perf_counter() - t1) * 1000
-            ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
-                                   [cv2.IMWRITE_JPEG_QUALITY, int(v.quality)])
             header = {
                 "type": "frame", "slot": self.k, "frame": frame, "n": len(self.frames),
                 "mode": self.mode, "playing": self.playing, "faults": self.faults_on, "people": len(people),

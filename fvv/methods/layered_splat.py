@@ -307,11 +307,14 @@ class LayeredSplat:
 
     # ---- render ------------------------------------------------------------------------
     @torch.no_grad()
-    def render(self, frame: int, camera: Camera, timer: StageTimer) -> np.ndarray:
+    def render(self, frame: int, camera: Camera, timer: StageTimer, as_tensor: bool = False):
         with timer("load_state"):
             fg = {k: v.float() for k, v in self.states[frame].items()}
         with timer("rasterize"):
             K = torch.tensor(camera.K, dtype=torch.float32, device=self.device)[None]
             img, _, _ = self._render(fg, self.bg.viewmat(camera)[None], K, camera.width, camera.height)
+        out = (img[0].clamp(0, 1) * 255).byte()
+        if as_tensor:
+            return out
         with timer("to_cpu"):
-            return (img[0].clamp(0, 1) * 255).byte().cpu().numpy()
+            return out.cpu().numpy()

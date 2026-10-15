@@ -102,6 +102,7 @@ class Synchronizer:
     def assemble(self, k: int, frame: int, packets: list[Packet]) -> FrameSet:
         t = k / self.fps
         fs = FrameSet(k, t, frame, status={c: "missing" for c in self.cams})
+        cand, imgs = [], []
         for p in packets:
             if p.arrival_t > t + self.buffer:
                 fs.status[p.cam] = "late"
@@ -109,31 +110,48 @@ class Synchronizer:
             if p.decode_error or p.image is None:
                 fs.status[p.cam] = "corrupt" if p.decode_error else "missing"
                 continue
-            fs.status[p.cam], img = self._health(p, k)
-            if img is not None:
-                fs.images[p.cam] = img
+            img, W, H = p.image, *self.expected[p.cam]
+            if img.shape[1] != W or img.shape[0] != H:
+                # resolution changed mid-stream: same field of view assumed -> resample to calibrated size
+                img = _resize(img, (H, W), "bilinear")
+                fs.status[p.cam] = "resized"
+            else:
+                fs.status[p.cam] = "ok"
+            cand.append(p.cam)
+            imgs.append(img)
+        if cand:
+            for c, img, bad in zip(cand, imgs, self._health_batch(cand, imgs, k)):
+                if bad:
+                    fs.status[c] = bad
+                else:
+                    fs.images[c] = img
         return fs
 
-    def _health(self, p: Packet, k: int) -> tuple[str, torch.Tensor | None]:
-        img = p.image
-        W, H = self.expected[p.cam]
-        status = "ok"
-        if img.shape[1] != W or img.shape[0] != H:
-            # resolution changed mid-stream: same field of view assumed -> resample to calibrated size
-            img = _resize(img, (H, W), "bilinear")
-            status = "resized"
-        small = F.interpolate(_hwc_to_chw(img)[None], size=(H // 8, W // 8), mode="area")[0]
-        if small.reshape(3, -1).std(1).max().item() < 8:
-            return "blank", None
-        # frozen = identical image for a *new* slot (re-reading the same slot, e.g. while paused, is fine)
-        prev = self.last_small.get(p.cam)
-        self.last_small[p.cam] = (k, small)
-        if prev is not None and prev[0] != k and torch.equal(prev[1], small):
-            return "frozen", None
-        gray = small.mean(0)[None, None]
-        sharp = F.conv2d(gray, self.lap.to(gray.device)).var().item()
-        ref = self.sharp_ref.setdefault(p.cam, sharp)
-        self.sharp_ref[p.cam] = 0.95 * ref + 0.05 * sharp if sharp > 0.5 * ref else ref
-        if sharp < 0.3 * ref:
-            return "blur", None
-        return status, img
+    def _health_batch(self, cams: list[str], imgs: list[torch.Tensor], k: int) -> list[str | None]:
+        """Blank / frozen / blur checks for all cameras at once on 1/8-res thumbnails, with a single
+        GPU->CPU transfer per frame (per-camera .item() calls were most of the old cost)."""
+        x = torch.stack(imgs).permute(0, 3, 1, 2).half()                    # (N, 3, H, W)
+        thumbs = F.avg_pool2d(x, 8)                                          # (N, 3, H/8, W/8)
+        std = thumbs.flatten(2).float().std(2).amax(1)
+        gray = thumbs.float().mean(1, keepdim=True)
+        sharp = F.conv2d(gray, self.lap.to(gray.device)).flatten(1).var(1)
+        # frozen = identical thumbnail for a *new* slot (re-reading the same slot, e.g. paused, is fine)
+        frozen = torch.zeros(len(cams), dtype=torch.bool, device=x.device)
+        for i, c in enumerate(cams):
+            prev = self.last_small.get(c)
+            if prev is not None and prev[0] != k and prev[1].shape == thumbs[i].shape:
+                frozen[i] = (prev[1] == thumbs[i]).all()          # stays on GPU (no sync)
+            self.last_small[c] = (k, thumbs[i])
+        stats = torch.stack([std, sharp, frozen.float()], 1).cpu().numpy()  # the one sync
+        out = []
+        for c, (sd, sh, fr) in zip(cams, stats):
+            if sd < 8:
+                out.append("blank")
+                continue
+            if fr:
+                out.append("frozen")
+                continue
+            ref = self.sharp_ref.setdefault(c, float(sh))
+            self.sharp_ref[c] = 0.95 * ref + 0.05 * float(sh) if sh > 0.5 * ref else ref
+            out.append("blur" if sh < 0.3 * ref else None)
+        return out

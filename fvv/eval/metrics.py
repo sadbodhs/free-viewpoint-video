@@ -44,3 +44,16 @@ def lpips(pred: np.ndarray, gt: np.ndarray, device: str = "cuda") -> float:
 def all_metrics(pred: np.ndarray, gt: np.ndarray) -> dict[str, float]:
     return {"psnr": psnr(pred, gt), "psnr_cc": psnr(color_correct(pred, gt), gt),
             "ssim": ssim(pred, gt), "lpips": lpips(pred, gt)}
+
+
+def people_metrics(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray, pad: int = 16) -> dict[str, float]:
+    """Scores restricted to the people: PSNR (color-corrected over the whole image, then measured
+    inside the mask) and LPIPS on the padded bounding box of the mask."""
+    if mask.sum() < 50:
+        return {}
+    cc = color_correct(pred, gt)
+    ys, xs = np.nonzero(mask)
+    y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, mask.shape[0])
+    x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, mask.shape[1])
+    crop = lambda im: np.ascontiguousarray(im[y0:y1, x0:x1])
+    return {"psnr_people": psnr(cc, gt, mask), "lpips_people": lpips(crop(cc), crop(gt))}

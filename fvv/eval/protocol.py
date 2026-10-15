@@ -12,7 +12,8 @@ import cv2
 import numpy as np
 
 from fvv.data import Camera, MultiViewSequence
-from .metrics import all_metrics
+from fvv.data.people import bones, capsule_mask
+from .metrics import all_metrics, people_metrics
 from .timing import StageTimer
 
 
@@ -64,7 +65,11 @@ def evaluate(method: NovelViewMethod, seq: MultiViewSequence, test_cams: list[st
             with timer("total"):
                 pred = method.render(f, cam, timer)
             gt = seq.image(c, f)
-            rows.append({"frame": f, "cam": c, **all_metrics(pred, gt)})
+            row = {"frame": f, "cam": c, **all_metrics(pred, gt)}
+            segs = list(bones(seq.bodies(f)).values())       # evaluation-only use of annotations
+            if segs:
+                row.update(people_metrics(pred, gt, capsule_mask(cam, segs, 30.0)))
+            rows.append(row)
             # every prediction is kept for the comparison video (scripts/make_comparison_video.py)
             (out / "pred" / c).mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(out / "pred" / c / f"{f:08d}.jpg"), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR),
@@ -74,15 +79,16 @@ def evaluate(method: NovelViewMethod, seq: MultiViewSequence, test_cams: list[st
                 cv2.imwrite(str(out / "images" / f"{c}_{f:08d}.jpg"),
                             cv2.cvtColor(side, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
 
-    keys = ("psnr", "psnr_cc", "ssim", "lpips")
+    keys = [k for k in ("psnr", "psnr_cc", "ssim", "lpips", "psnr_people", "lpips_people")
+            if any(k in r for r in rows)]
+    avg = lambda rs, k: float(np.mean([r[k] for r in rs if k in r]))
     result = {
         "method": method.name,
         "train_cams": train_cams,
         "test_cams": test_cams,
         "frames": [frames[0], frames[-1], len(frames)],
-        "mean": {k: float(np.mean([r[k] for r in rows])) for k in keys},
-        "per_camera": {c: {k: float(np.mean([r[k] for r in rows if r["cam"] == c])) for k in keys}
-                       for c in test_cams},
+        "mean": {k: avg(rows, k) for k in keys},
+        "per_camera": {c: {k: avg([r for r in rows if r["cam"] == c], k) for k in keys} for c in test_cams},
         "latency": timer.summary(),
         "rows": rows,
     }

@@ -18,6 +18,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 
 from fvv.data import MultiViewSequence
 from fvv.eval import StageTimer, load_or_create_split
@@ -87,8 +88,10 @@ def main():
         for k, f in enumerate(frames):
             t = k / args.fps
             n_before = {s: len(v) for s, v in timer.times.items()}
+            packets = streams.packets(k)     # simulating the feeds and their faults is not pipeline work
+            torch.cuda.synchronize()         # (finish the simulated blur/resize before timing starts)
             with timer("sync_health"):
-                fs = sync.assemble(k, f, streams.packets(k))
+                fs = sync.assemble(k, f, packets)
             status_counts.update(fs.status.values())
             if t < busy_until and last_img is not None:        # pipeline still busy: slot dropped
                 dropped += 1
@@ -99,6 +102,8 @@ def main():
                 img = method.render_view(state, path[k], timer)
                 ms = sum(v[-1] for s, v in timer.times.items() if len(v) > n_before.get(s, 0))
                 slot_ms.append(ms)
+                if ms > budget_ms:
+                    print(f"slot {k}: {ms:.0f} ms > budget", flush=True)
                 busy_until = t + ms / 1000
                 last_img = img
                 if args.eval_every and k % args.eval_every == 0:
