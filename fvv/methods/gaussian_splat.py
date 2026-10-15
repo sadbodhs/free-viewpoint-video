@@ -86,6 +86,41 @@ def prune_near_cameras(splat: "GaussianSplat", cameras: list, down: np.ndarray, 
     return int(prune.sum())
 
 
+@torch.no_grad()
+def contribution(splat: "GaussianSplat", cameras: list) -> torch.Tensor:
+    """Each Gaussian's total blending weight (in pixels) over the given views: the gradient of
+    the summed render w.r.t. a per-Gaussian unit feature (exact, one pass per view)."""
+    p = splat.params
+    n = len(p["means"])
+    total = torch.zeros(n, device=p["means"].device)
+    for cam in cameras:
+        with torch.enable_grad():
+            feat = torch.ones(n, 1, device=total.device, requires_grad=True)
+            out, _, _ = rasterization(p["means"], p["quats"], torch.exp(p["scales"]), torch.sigmoid(p["opacities"]),
+                                      feat, splat.viewmat(cam)[None],
+                                      torch.tensor(cam.K, dtype=torch.float32, device=total.device)[None],
+                                      cam.width, cam.height, packed=False)
+            out.sum().backward()
+        total += feat.grad[:, 0]
+    return total
+
+
+@torch.no_grad()
+def compact(splat: "GaussianSplat", cameras: list, keep: float = 1.0, sh_degree: int = 3) -> int:
+    """Keep the `keep` fraction of Gaussians that contribute most to the given views, and cut the
+    view-dependent color to `sh_degree` (walls and floors barely change color with angle)."""
+    n0 = len(splat.params["means"])
+    if keep < 1.0:
+        idx = contribution(splat, cameras).argsort(descending=True)[: int(n0 * keep)]
+        for k in list(splat.params.keys()):
+            splat.params[k] = torch.nn.Parameter(splat.params[k].detach()[idx], requires_grad=False)
+    if sh_degree < splat.sh_degree:
+        n_rest = (sh_degree + 1) ** 2 - 1
+        splat.params["shN"] = torch.nn.Parameter(splat.params["shN"].detach()[:, :n_rest], requires_grad=False)
+        splat.sh_degree = sh_degree
+    return n0 - len(splat.params["means"])
+
+
 class GaussianSplat:
     name = "3dgs"
     single_frame = True
@@ -99,6 +134,7 @@ class GaussianSplat:
         self.ckpt_dir = Path(ckpt_dir) if ckpt_dir else None
         self.retrain, self.device = retrain, device
         self.params: torch.nn.ParameterDict | None = None
+        self.sh_degree = 3
 
     # ---- coordinates -------------------------------------------------------------------
     def viewmat(self, cam: Camera) -> torch.Tensor:
@@ -188,7 +224,8 @@ class GaussianSplat:
             "shN": torch.nn.Parameter(torch.zeros(n, 15, 3, device=dev)),
         })
 
-    def _rasterize(self, viewmats, Ks, W, H, sh_degree=3):
+    def _rasterize(self, viewmats, Ks, W, H, sh_degree=None):
+        sh_degree = self.sh_degree if sh_degree is None else sh_degree
         p = self.params
         return rasterization(
             p["means"], p["quats"], torch.exp(p["scales"]), torch.sigmoid(p["opacities"]),

@@ -21,7 +21,7 @@ from gsplat import rasterization, spherical_harmonics
 from fvv.data import Camera, MultiViewSequence
 from fvv.data.people import estimate_floor
 from fvv.eval import StageTimer
-from .gaussian_splat import SH_C0, GaussianSplat, apply_affine, prune_near_cameras
+from .gaussian_splat import SH_C0, GaussianSplat, apply_affine, compact, prune_near_cameras
 
 
 class VisualHull:
@@ -32,7 +32,8 @@ class VisualHull:
                  mask_thresh: float = 0.08, miss_frac: float = 0.1, min_views: int = 3, k_views: int = 3,
                  seg: str | None = None, seg_res: int = 256, seg_hi: float = 0.5, seg_lo: float = 0.2,
                  seg_gate: bool = True, texture: str = "pixel", grid_frac: float = 0.97,
-                 bg_name: str = "layered_bg", prune_near_cm: float = 60.0,
+                 bg_name: str = "layered_bg", prune_near_cm: float = 60.0, bg_keep: float = 0.5,
+                 bg_sh_degree: int = 3,
                  ckpt_dir: str | Path | None = None, device: str = "cuda", **_):
         self.coarse, self.fine, self.height = coarse_cm, fine_cm, height_cm
         self.mask_thresh, self.miss_frac, self.min_views, self.k = mask_thresh, miss_frac, min_views, k_views
@@ -42,7 +43,7 @@ class VisualHull:
         # optional person segmentation fused with background difference (fills gray-on-gray holes)
         self.seg, self.seg_res, self.seg_hi, self.seg_lo, self.seg_gate = seg, seg_res, seg_hi, seg_lo, seg_gate
         self.texture, self.grid_frac, self.bg_name = texture, grid_frac, bg_name
-        self.prune_near_cm = prune_near_cm
+        self.prune_near_cm, self.bg_keep, self.bg_sh_degree = prune_near_cm, bg_keep, bg_sh_degree
         self.seg_net = self._load_seg(seg) if seg else None
 
     # ---- offline setup -----------------------------------------------------------------
@@ -57,6 +58,9 @@ class VisualHull:
         if self.prune_near_cm:
             n = prune_near_cameras(self.bg, list(seq.cameras.values()), down, floor, self.prune_near_cm)
             print(f"[hull] pruned {n:,} background floaters within {self.prune_near_cm:.0f} cm of cameras")
+        if self.bg_keep < 1.0 or self.bg_sh_degree < 3:
+            n = compact(self.bg, [seq.camera(c) for c in train_cams], self.bg_keep, self.bg_sh_degree)
+            print(f"[hull] compacted background: -{n:,} Gaussians, SH degree {self.bg.sh_degree}")
         self.cam_index = {c: i for i, c in enumerate(self.bg.cam_names)}
         self.cams = {c: seq.camera(c) for c in train_cams}
         self.viewmats = {c: self.bg.viewmat(cam) for c, cam in self.cams.items()}
@@ -258,7 +262,7 @@ class VisualHull:
             # contribution, a 4th channel the fraction of each pixel the people cover. Haze in front of
             # the people then just dims them, as real compositing would.
             campos = -vm[:3, :3].T @ vm[:3, 3]
-            bg_rgb = torch.clamp_min(spherical_harmonics(3, bg["means"] - campos,
+            bg_rgb = torch.clamp_min(spherical_harmonics(self.bg.sh_degree, bg["means"] - campos,
                                                          torch.cat([bg["sh0"], bg["shN"]], 1)) + 0.5, 0)
             feats = torch.cat([torch.cat([bg_rgb, torch.zeros(len(bg_rgb), 1, device=dev)], 1),
                                torch.cat([torch.zeros(n, 3, device=dev), torch.ones(n, 1, device=dev)], 1)])
@@ -343,9 +347,11 @@ class VisualHull:
             img, _, _ = rasterization(
                 torch.cat([x, bg["means"]]), torch.cat([q, bg["quats"]]), torch.cat([s, torch.exp(bg["scales"])]),
                 torch.cat([opac, torch.sigmoid(bg["opacities"])]),
-                torch.cat([torch.cat([((rgb - 0.5) / SH_C0)[:, None], torch.zeros(n, 15, 3, device=dev)], 1),
+                torch.cat([torch.cat([((rgb - 0.5) / SH_C0)[:, None],
+                                      torch.zeros(n, bg["shN"].shape[1], 3, device=dev)], 1),
                            torch.cat([bg["sh0"], bg["shN"]], 1)]),
-                self.bg.viewmat(camera)[None], K, camera.width, camera.height, sh_degree=3, packed=False)
+                self.bg.viewmat(camera)[None], K, camera.width, camera.height, sh_degree=self.bg.sh_degree,
+                packed=False)
         out = (img[0].clamp(0, 1) * 255).byte()
         if as_tensor:
             return out

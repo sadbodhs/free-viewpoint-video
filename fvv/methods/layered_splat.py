@@ -126,9 +126,9 @@ class LayeredSplat:
             torch.cat([fg["means"], bg["means"]]), torch.cat([fg["quats"], bg["quats"]]),
             torch.exp(torch.cat([fg["scales"], bg["scales"]])),
             torch.sigmoid(torch.cat([fg["opacities"], bg["opacities"]])),
-            torch.cat([torch.cat([fg["sh0"], torch.zeros(n, 15, 3, device=self.device)], 1),
+            torch.cat([torch.cat([fg["sh0"], torch.zeros(n, bg["shN"].shape[1], 3, device=self.device)], 1),
                        torch.cat([bg["sh0"], bg["shN"]], 1)]),
-            viewmats, Ks, W, H, sh_degree=3, packed=False, near_plane=0.01)
+            viewmats, Ks, W, H, sh_degree=self.bg.sh_degree, packed=False, near_plane=0.01)
 
     # ---- fit ---------------------------------------------------------------------------
     def fit(self, seq: MultiViewSequence, train_cams: list[str], frames: list[int]) -> None:
