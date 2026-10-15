@@ -29,7 +29,7 @@ class VisualHull:
     single_frame = False
 
     def __init__(self, coarse_cm: float = 8.0, fine_cm: float = 2.0, height_cm: float = 220.0,
-                 mask_thresh: float = 0.08, miss_frac: float = 0.1, min_views: int = 3, k_views: int = 3,
+                 mask_thresh: float = 0.08, miss_frac: float = 0.1, min_views: int = 3, k_views: int = 6,
                  seg: str | None = None, seg_res: int = 256, seg_hi: float = 0.5, seg_lo: float = 0.2,
                  seg_gate: bool = True, texture: str = "pixel", grid_frac: float = 0.97,
                  bg_name: str = "layered_bg", prune_near_cm: float = 60.0, bg_keep: float = 0.5,
@@ -295,6 +295,7 @@ class VisualHull:
             rgb = torch.zeros(len(z), 3, device=dev)
             wsum = torch.zeros(len(z), device=dev)
             fallback = torch.zeros(len(z), 3, device=dev)
+            n_inb = torch.zeros(len(z), device=dev)
             tol = 3.0 / self.bg.scale                                          # 3 cm depth tolerance
             for j, (i, c) in enumerate(zip(sel, chosen)):
                 Xs = Xw @ self.viewmats[c][:3, :3].T + self.viewmats[c][:3, 3]
@@ -315,10 +316,20 @@ class VisualHull:
                 rgb += col * w[:, None]
                 wsum += w
                 fallback += col * inb.float()[:, None]
+                n_inb += inb.float()
+            # no visible source: average of the sources that at least frame the point
             people = torch.where((wsum > 0)[:, None], rgb / wsum.clamp(min=1e-6)[:, None],
-                                 fallback / len(chosen))
+                                 fallback / n_inb.clamp(min=1)[:, None])
             img = img.clone()
             img[ys, xs] += wp[ys, xs, None] * people.clamp(0, 1)
+            unseen = n_inb == 0
+            if unseen.any():
+                # no source camera frames this point at all (e.g. a person right in front of the
+                # virtual camera): show the background there rather than painting it black
+                bg_only, _, _ = rasterization(bg["means"], bg["quats"], torch.exp(bg["scales"]),
+                                              torch.sigmoid(bg["opacities"]), torch.cat([bg["sh0"], bg["shN"]], 1),
+                                              vm[None], K[None], W, H, sh_degree=self.bg.sh_degree, packed=False)
+                img[ys[unseen], xs[unseen]] = bg_only[0, ys[unseen], xs[unseen]]
         return img.clamp(0, 1)
 
     @torch.no_grad()
