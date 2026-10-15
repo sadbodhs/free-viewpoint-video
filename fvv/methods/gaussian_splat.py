@@ -62,6 +62,30 @@ def gauge_fixed(affine: torch.Tensor) -> torch.Tensor:
     return affine - affine.mean(0) + torch.eye(3, 4, device=affine.device)
 
 
+@torch.no_grad()
+def prune_near_cameras(splat: "GaussianSplat", cameras: list, down: np.ndarray, floor: float,
+                       near_cm: float = 60.0) -> int:
+    """Remove floaters hanging just in front of rig camera positions (wall-hugging haze).
+
+    Training views see them blended into the wall behind, so optimization keeps them; a virtual
+    camera near that spot looks straight through them. Nothing real floats within `near_cm` in
+    front of a wall-mounted lens; the floor (within 5 cm) is kept. Uses camera positions only.
+    """
+    dev = splat.params["means"].device
+    x = splat.params["means"] * splat.scale + torch.tensor(splat.center, dtype=torch.float32, device=dev)
+    keep_floor = floor - x @ torch.tensor(down, dtype=torch.float32, device=dev) <= 5.0
+    prune = torch.zeros(len(x), dtype=torch.bool, device=dev)
+    for c in cameras:
+        rel = x - torch.tensor(c.center, dtype=torch.float32, device=dev)
+        dist = rel.norm(dim=1)
+        ahead = rel @ torch.tensor(c.forward, dtype=torch.float32, device=dev) / dist.clamp(min=1e-6)
+        prune |= (dist > 5) & (dist < near_cm) & (ahead > 0.3)
+    prune &= ~keep_floor
+    for k in list(splat.params.keys()):
+        splat.params[k] = torch.nn.Parameter(splat.params[k].detach()[~prune], requires_grad=False)
+    return int(prune.sum())
+
+
 class GaussianSplat:
     name = "3dgs"
     single_frame = True

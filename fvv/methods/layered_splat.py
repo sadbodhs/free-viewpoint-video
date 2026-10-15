@@ -27,7 +27,7 @@ from fvv.data import Camera, MultiViewSequence
 from fvv.data.people import EDGE_RADIUS, bone_motion, bones, capsule_mask, sample_capsules
 from fvv.eval import StageTimer
 from fvv.geometry import load_points_ply
-from .gaussian_splat import SH_C0, GaussianSplat, apply_affine, photometric_loss
+from .gaussian_splat import SH_C0, GaussianSplat, apply_affine, photometric_loss, prune_near_cameras
 
 FG_KEYS = ("means", "scales", "quats", "opacities", "sh0")
 
@@ -68,10 +68,12 @@ class LayeredSplat:
     def __init__(self, bg_frames: int = 12, bg_iters: int = 30_000, fg_iters: int = 5_000,
                  steps_per_frame: int = 500, radius: float = 35.0, fg_cap: int = 250_000,
                  rigidity: float = 1e3, max_scale: float = 6.0, knn: int = 8, seed: int = 0,
+                 prune_near_cm: float = 60.0,
                  ckpt_dir: str | Path | None = None, retrain: bool = False, device: str = "cuda", **_):
         self.bg_frames, self.bg_iters, self.fg_iters = bg_frames, bg_iters, fg_iters
         self.steps, self.radius, self.fg_cap = steps_per_frame, radius, fg_cap
         self.rigidity, self.max_scale, self.knn, self.seed = rigidity, max_scale, knn, seed
+        self.prune_near_cm = prune_near_cm
         self.ckpt_dir = Path(ckpt_dir) if ckpt_dir else None
         self.retrain, self.device = retrain, device
         self.bg = GaussianSplat(iters=bg_iters, seed=seed, device=device)
@@ -146,6 +148,10 @@ class LayeredSplat:
         for p in self.bg.params.values():
             p.requires_grad_(False)
         self._estimate_floor(seq)
+        if self.prune_near_cm:
+            floor_cm = self.floor_n * self.bg.scale + self.bg.center @ self.down
+            n = prune_near_cameras(self.bg, list(seq.cameras.values()), self.down, floor_cm, self.prune_near_cm)
+            print(f"[layered] pruned {n:,} background floaters within {self.prune_near_cm:.0f} cm of cameras")
 
         if fg_ckpt and fg_ckpt.exists() and not self.retrain:
             self.states = torch.load(fg_ckpt, map_location=self.device, weights_only=False)

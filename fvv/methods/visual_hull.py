@@ -21,7 +21,7 @@ from gsplat import rasterization, spherical_harmonics
 from fvv.data import Camera, MultiViewSequence
 from fvv.data.people import estimate_floor
 from fvv.eval import StageTimer
-from .gaussian_splat import SH_C0, GaussianSplat, apply_affine
+from .gaussian_splat import SH_C0, GaussianSplat, apply_affine, prune_near_cameras
 
 
 class VisualHull:
@@ -32,6 +32,7 @@ class VisualHull:
                  mask_thresh: float = 0.08, miss_frac: float = 0.1, min_views: int = 3, k_views: int = 3,
                  seg: str | None = None, seg_res: int = 256, seg_hi: float = 0.5, seg_lo: float = 0.2,
                  seg_gate: bool = True, texture: str = "pixel", grid_frac: float = 0.97,
+                 bg_name: str = "layered_bg", prune_near_cm: float = 60.0,
                  ckpt_dir: str | Path | None = None, device: str = "cuda", **_):
         self.coarse, self.fine, self.height = coarse_cm, fine_cm, height_cm
         self.mask_thresh, self.miss_frac, self.min_views, self.k = mask_thresh, miss_frac, min_views, k_views
@@ -40,17 +41,22 @@ class VisualHull:
         self.frame_cache: dict[int, dict] = {}
         # optional person segmentation fused with background difference (fills gray-on-gray holes)
         self.seg, self.seg_res, self.seg_hi, self.seg_lo, self.seg_gate = seg, seg_res, seg_hi, seg_lo, seg_gate
-        self.texture, self.grid_frac = texture, grid_frac
+        self.texture, self.grid_frac, self.bg_name = texture, grid_frac, bg_name
+        self.prune_near_cm = prune_near_cm
         self.seg_net = self._load_seg(seg) if seg else None
 
     # ---- offline setup -----------------------------------------------------------------
     def fit(self, seq: MultiViewSequence, train_cams: list[str], frames: list[int]) -> None:
         self.seq, self.train_cams = seq, train_cams
         self.bg = GaussianSplat(device=self.device)
-        self.bg.load(self.ckpt_dir / f"layered_bg_{seq.root.name}.pt")
+        self.bg.load(self.ckpt_dir / f"{self.bg_name}_{seq.root.name}.pt")
         self.bg.name = "layered_bg"
         for p in self.bg.params.values():
             p.requires_grad_(False)
+        down, floor = estimate_floor(seq)
+        if self.prune_near_cm:
+            n = prune_near_cameras(self.bg, list(seq.cameras.values()), down, floor, self.prune_near_cm)
+            print(f"[hull] pruned {n:,} background floaters within {self.prune_near_cm:.0f} cm of cameras")
         self.cam_index = {c: i for i, c in enumerate(self.bg.cam_names)}
         self.cams = {c: seq.camera(c) for c in train_cams}
         self.viewmats = {c: self.bg.viewmat(cam) for c, cam in self.cams.items()}
@@ -79,7 +85,6 @@ class VisualHull:
         self.P_half = torch.stack([half @ self.Ks[c] @ self.viewmats[c][:3] for c in self.order])
 
         # voxel grid: rig footprint x [floor, floor + height], normalized coordinates
-        down, floor = estimate_floor(seq)
         C = np.stack([cam.center for cam in seq.cameras.values()])
         h = C @ down
         horiz = C - np.outer(h, down)
