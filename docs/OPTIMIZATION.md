@@ -23,6 +23,16 @@ tensor shapes) → next: fixed 27-camera batch + validity mask (also enables CUD
 background splat shows faint haze from held-out angles, which dims people there → background
 quality is the next accuracy lever, then E3 (compact background, ~3 ms of the 6 ms render).
 
+## Progress, round 2 (2026-10-15, commits 52d681d, 41a775c, f723a55)
+
+| Item | Result |
+|---|---|
+| Fixed-shape 27-camera batches (validity mask) | allocation stalls gone: replay 0 dropped slots (was 4 / 10 with faults), worst frame 20–25 ms (was 142–150), mean ~12.5 ms |
+| Prune floaters within 60 cm in front of rig cameras | haze found by depth-sliced opacity (15–37% within 1 m of held-out lenses). Hull cc-PSNR 24.77 → 25.21; layered 27.55 → **28.46**, people 25.71 → 26.12 |
+| Compact background by contribution (keep 50%) | 942k → 471k Gaussians, no quality loss, render 5.3 → 4.8 ms/viewer; SH degree 1 costs 0.65 dB (kept 3) |
+
+Next: per-frame shared source depth maps (now the main per-viewer cost), then multi-viewer batching.
+
 ## 1. Where the cost is today
 
 **Live mode, per frame (shared by all viewers)** — from `outputs/live/.../hull_clean.json`:
