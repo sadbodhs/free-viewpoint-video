@@ -7,8 +7,13 @@ invalid for that slot -- the pipeline never waits.
 """
 from dataclasses import dataclass, field
 
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import cv2
 import numpy as np
 import torch
+from tqdm import tqdm
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 
@@ -36,21 +41,74 @@ class FrameSet:
 
 
 class ReplayStreams:
-    """Replays a MultiViewSequence as live streams with faults. Frames are preloaded into GPU
-    memory, as an NVDEC ingest would deliver them (decode itself is out of the measured path)."""
+    """Replays a MultiViewSequence as live streams with faults.
+
+    Short clips: frames preloaded raw into GPU memory. Long clips (compressed=True, automatic
+    above ~6000 images): frames kept JPEG-encoded in RAM (~80 KB each) and the next slot is
+    decoded ahead on CPU threads while the GPU works on the current one -- standing in for a
+    hardware decoder (NVDEC) running in parallel. `decode_wait_ms` records any time the
+    pipeline had to wait for the decoder.
+    """
 
     def __init__(self, seq: MultiViewSequence, cams: list[str], frames: list[int], faults: FaultConfig,
-                 fps: float = 30.0, device: str = "cuda"):
+                 fps: float = 30.0, device: str = "cuda", compressed: bool | None = None, workers: int = 12,
+                 decode_workers: int = 4):
         self.seq, self.cams, self.frames, self.faults, self.fps = seq, cams, frames, faults, fps
+        self.device = device
         self.rng = np.random.default_rng(faults.seed)
+        self.compressed = len(frames) * len(cams) > 6000 if compressed is None else compressed
+        self.pool = ThreadPoolExecutor(workers)
+        self.decode_wait_ms: list[float] = []
+        keys = [(c, f) for f in frames for c in cams]
         # includes the dataset's own dropped (blank) frames, so health checks see them live
-        self.cache = {(c, f): torch.from_numpy(seq.image(c, f)).to(device) for f in frames for c in cams}
+        if self.compressed:
+            def encode(key):
+                rgb = seq.image(*key)
+                return key, cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 92])[1]
+            self.jpg = dict(tqdm(self.pool.map(encode, keys), total=len(keys), desc="encoding frames", mininterval=5))
+            self._io = ThreadPoolExecutor(1)
+            self._ahead: dict[int, object] = {}
+            cv2.setNumThreads(1)                     # no OpenCV thread pool inside each decode worker
+            self.dec_pool = ThreadPoolExecutor(decode_workers)
+            self._staging = None
+        else:
+            self.cache = {k: torch.from_numpy(seq.image(*k)).to(device) for k in keys}
+
+    def _decode_frame(self, f: int) -> dict[str, torch.Tensor]:
+        if self._staging is None:
+            h, w = cv2.imdecode(self.jpg[(self.cams[0], f)], cv2.IMREAD_COLOR).shape[:2]
+            self._staging = torch.empty(len(self.cams), h, w, 3, dtype=torch.uint8).pin_memory()
+
+        def dec(i):                                  # decode straight into the pinned staging buffer
+            self._staging[i].numpy()[:] = cv2.imdecode(self.jpg[(self.cams[i], f)], cv2.IMREAD_COLOR)
+
+        list(self.dec_pool.map(dec, range(len(self.cams))))
+        gpu = self._staging.to(self.device, non_blocking=True).flip(-1)    # BGR -> RGB on the GPU
+        torch.cuda.current_stream().synchronize()   # staging buffer is reused for the next frame
+        return {c: gpu[i] for i, c in enumerate(self.cams)}
+
+    def _slot_frames(self, k: int) -> dict[str, torch.Tensor]:
+        """Decoded frames of slot k (waits for the read-ahead if needed), and starts decoding k+1."""
+        t0 = time.perf_counter()
+        fut = self._ahead.pop(k, None)
+        out = fut.result() if fut is not None else self._decode_frame(self.frames[k])
+        self.decode_wait_ms.append((time.perf_counter() - t0) * 1000)
+        nxt = (k + 1) % len(self.frames)
+        self._ahead = {nxt: self._ahead.get(nxt) or self._io.submit(self._decode_frame, self.frames[nxt])}
+        return out
+
+    def frame(self, cam: str, f: int) -> torch.Tensor:
+        """One decoded frame (GPU tensor), e.g. for warm-up."""
+        if not self.compressed:
+            return self.cache[(cam, f)]
+        return self._decode_frame(f)[cam]
 
     def packets(self, k: int) -> list[Packet]:
         """All packets captured at slot k (one per camera, unless dropped)."""
         f, t = self.frames[k], k / self.fps
         fc = self.faults
         out = []
+        current = self._slot_frames(k) if self.compressed else None
         for c in self.cams:
             if any(w.active(c, t) for w in fc.drops):
                 continue
@@ -58,7 +116,12 @@ class ReplayStreams:
             if any(w.active(c, t) for w in fc.freezes):
                 start = min(w.start for w in fc.freezes if w.active(c, t))
                 src = self.frames[min(int(start * self.fps), k)]
-            img = self.cache.get((c, src))
+            if not self.compressed:
+                img = self.cache.get((c, src))
+            elif src == f:
+                img = current.get(c)
+            else:                                    # frozen stream: an older frame (rare, decoded on demand)
+                img = self.frame(c, src)
             arrival = t + (fc.latency_ms + abs(self.rng.normal(0, fc.jitter_ms))) / 1000
             err = False
             if img is not None:

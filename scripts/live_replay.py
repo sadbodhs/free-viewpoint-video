@@ -46,7 +46,10 @@ def main():
     ap.add_argument("--method", default="hull")
     ap.add_argument("--faults", default="", help="see fvv/live/faults.py")
     ap.add_argument("--tag", default="")
-    ap.add_argument("--seconds", type=float, default=5.0)
+    ap.add_argument("--seconds", type=float, default=5.0, help="replay length (capped by the clip)")
+    ap.add_argument("--start", type=float, default=0.0, help="start offset into the clip (seconds)")
+    ap.add_argument("--compressed", choices=["auto", "on", "off"], default="auto",
+                    help="keep frames JPEG-compressed with read-ahead decoding (auto: long replays)")
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--buffer-ms", type=float, default=100.0, help="jitter buffer / slot deadline")
     ap.add_argument("--scale", type=float, default=0.5)
@@ -57,13 +60,15 @@ def main():
     seq = MultiViewSequence(args.root, undistort=True, scale=args.scale)
     test_cams = load_or_create_split(seq)
     cams = [c for c in seq.camera_names if c not in test_cams]
-    frames = seq.frame_ids[: int(args.seconds * args.fps)]
+    s0 = int(args.start * args.fps)
+    frames = seq.frame_ids[s0: s0 + int(args.seconds * args.fps)]
     faults = FaultConfig.parse(args.faults)
 
     method = make_method(args.method, ckpt_dir=f"outputs/models/{seq.root.name}")
     method.fit(seq, cams, frames)
     print(f"preloading {len(frames)} frames x {len(cams)} cameras ...", flush=True)
-    streams = ReplayStreams(seq, cams, frames, faults, args.fps)
+    streams = ReplayStreams(seq, cams, frames, faults, args.fps,
+                            compressed={"auto": None, "on": True, "off": False}[args.compressed])
     sync = Synchronizer(cams, {c: (seq.camera(c).width, seq.camera(c).height) for c in cams},
                         args.fps, args.buffer_ms)
 
@@ -75,7 +80,7 @@ def main():
 
     # warm-up outside the measured run (CUDA init, kernel compilation, first-time buffers)
     sync.assemble(0, frames[0], streams.packets(0))
-    method.render_view(method.process({c: streams.cache[(c, frames[0])] for c in cams}, StageTimer()),
+    method.render_view(method.process({c: streams.frame(c, frames[0]) for c in cams}, StageTimer()),
                        path[0], StageTimer())
 
     tag = f"_{args.tag}" if args.tag else ""
@@ -84,7 +89,7 @@ def main():
     W, H = even(np.zeros((template.height + 26, template.width))).shape[::-1]
     timer = StageTimer()
     busy_until, dropped, last_img = 0.0, 0, None
-    status_counts, evals, slot_ms = Counter(), [], []
+    status_counts, evals, slot_ms, voxels = Counter(), [], [], []
     with VideoWriter(str(out / f"{args.method}{tag}.mp4"), W, H, fps=args.fps) as vw:
         for k, f in enumerate(frames):
             t = k / args.fps
@@ -100,6 +105,7 @@ def main():
                 label(img, f"DROPPED slot {k}", pos="top")
             else:
                 state = method.process(fs.images, timer)
+                voxels.append(len(state["voxels"]))
                 img = method.render_view(state, path[k], timer)
                 ms = sum(v[-1] for s, v in timer.times.items() if len(v) > n_before.get(s, 0))
                 slot_ms.append(ms)
@@ -129,10 +135,14 @@ def main():
                     "max": float(np.max(slot_ms))},
         "stages_ms": {s: {"mean": round(v["mean_ms"], 2), "p95": round(v["p95_ms"], 2)} for s, v in lat.items()},
         "camera_status": dict(status_counts),
+        "voxels": {"mean": float(np.mean(voxels)), "max": int(np.max(voxels))},
         "heldout": {"psnr": float(np.mean([e["psnr"] for e in evals])) if evals else None,
                     "psnr_cc": float(np.mean([e["psnr_cc"] for e in evals])) if evals else None,
                     "n": len(evals)},
         "glass_to_glass_ms_estimate": args.buffer_ms + float(np.mean(slot_ms)),
+        "decode_wait_ms": ({"mean": float(np.mean(streams.decode_wait_ms[1:])),
+                            "p95": float(np.percentile(streams.decode_wait_ms[1:], 95))}
+                           if len(streams.decode_wait_ms) > 1 else None),
     }
     (out / f"{args.method}{tag}.json").write_text(json.dumps(report, indent=1))
     print(json.dumps({k: v for k, v in report.items()}, indent=1))
