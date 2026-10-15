@@ -4,6 +4,25 @@ Study of the current system (RTX 3090, 27 cameras at 960×540, 30 fps) and a pri
 All "today" numbers are measured; "target" numbers are estimates to be verified by the same
 harnesses (`scripts/live_replay.py`, `scripts/evaluate.py`).
 
+## Progress (2026-10-14, commit ee3f0ce)
+
+| Item | Status | Result (30 frames, 3 held-out cameras) |
+|---|---|---|
+| A1 people-only metrics | done | baseline people PSNR / LPIPS: layered 25.7 / 0.204, hull 21.5 / 0.334 |
+| E1 batched health checks | done | 6.4 → ~2.3 ms |
+| E2 half-res fp16 masks | done | 8.2 → ~2 ms |
+| E5 surface voxels | done | 45k → 22k voxels, 0.45 ms |
+| A3 per-pixel texturing | done | people LPIPS 0.334 → **0.259**, people PSNR 21.5 → 21.8 |
+| Voxel grid to 97% of rig radius | done | people near the wall no longer cut off |
+| E4 GPU JPEG + E7 skip unchanged | done (viewer) | 0.25 vs 1.4 ms encode, no CPU |
+| A2 segmentation fusion | tried, off by default | blobby network masks fatten the hull: people PSNR 21.8 → 21.1 |
+| Shared processing (CUDA-timed) | | ~16.5 → **4.6 ms**; per-viewer render 6.0 ms |
+
+Found along the way: one-off 100–150 ms spikes when the number of healthy cameras changes (new
+tensor shapes) → next: fixed 27-camera batch + validity mask (also enables CUDA graphs). The
+background splat shows faint haze from held-out angles, which dims people there → background
+quality is the next accuracy lever, then E3 (compact background, ~3 ms of the 6 ms render).
+
 ## 1. Where the cost is today
 
 **Live mode, per frame (shared by all viewers)** — from `outputs/live/.../hull_clean.json`:
