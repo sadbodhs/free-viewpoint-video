@@ -73,7 +73,8 @@ def main():
     minimap = MiniMap([seq.camera(c) for c in seq.camera_names], down, size=180)
     budget_ms = 1000 / args.fps
 
-    # warm-up outside the measured run (CUDA init, kernel compilation)
+    # warm-up outside the measured run (CUDA init, kernel compilation, first-time buffers)
+    sync.assemble(0, frames[0], streams.packets(0))
     method.render_view(method.process({c: streams.cache[(c, frames[0])] for c in cams}, StageTimer()),
                        path[0], StageTimer())
 

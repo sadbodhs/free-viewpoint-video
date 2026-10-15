@@ -96,6 +96,8 @@ class Synchronizer:
                  buffer_ms: float = 100.0):
         self.cams, self.expected, self.fps, self.buffer = cams, expected_size, fps, buffer_ms / 1000
         self.last_small: dict[str, tuple[int, torch.Tensor]] = {}   # cam -> (slot, thumbnail)
+        self.slot = {c: i for i, c in enumerate(cams)}
+        self.buf: torch.Tensor | None = None                         # fixed (V, H, W, 3) health batch
         self.sharp_ref: dict[str, float] = {}
         self.lap = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)[None, None]
 
@@ -130,13 +132,19 @@ class Synchronizer:
     def _health_batch(self, cams: list[str], imgs: list[torch.Tensor], k: int) -> list[str | None]:
         """Blank / frozen / blur checks for all cameras at once on 1/8-res thumbnails, with a single
         GPU->CPU transfer per frame (per-camera .item() calls were most of the old cost)."""
-        x = torch.stack(imgs).permute(0, 3, 1, 2).half()                    # (N, 3, H, W)
-        thumbs = F.avg_pool2d(x, 8)                                          # (N, 3, H/8, W/8)
-        std = thumbs.flatten(2).float().std(2).amax(1)
-        gray = thumbs.float().mean(1, keepdim=True)
-        sharp = F.conv2d(gray, self.lap.to(gray.device)).flatten(1).var(1)
+        # fixed-shape batch over all cameras (shapes never change -> no allocation spikes)
+        H, W, dev = *imgs[0].shape[:2], imgs[0].device
+        if self.buf is None or self.buf.shape[1:3] != (H, W):
+            self.buf = torch.zeros(len(self.cams), H, W, 3, dtype=torch.uint8, device=dev)
+        rows = torch.tensor([self.slot[c] for c in cams], device=dev)
+        for c, img in zip(cams, imgs):
+            self.buf[self.slot[c]].copy_(img)
+        allthumbs = F.avg_pool2d(self.buf.permute(0, 3, 1, 2).half(), 8)   # (V, 3, H/8, W/8)
+        allstd = allthumbs.flatten(2).float().std(2).amax(1)
+        allsharp = F.conv2d(allthumbs.float().mean(1, keepdim=True), self.lap.to(dev)).flatten(1).var(1)
+        thumbs, std, sharp = allthumbs[rows], allstd[rows], allsharp[rows]
         # frozen = identical thumbnail for a *new* slot (re-reading the same slot, e.g. paused, is fine)
-        frozen = torch.zeros(len(cams), dtype=torch.bool, device=x.device)
+        frozen = torch.zeros(len(cams), dtype=torch.bool, device=dev)
         for i, c in enumerate(cams):
             prev = self.last_small.get(c)
             if prev is not None and prev[0] != k and prev[1].shape == thumbs[i].shape:

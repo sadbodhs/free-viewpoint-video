@@ -67,6 +67,17 @@ class VisualHull:
                 M = torch.linalg.inv(A[:, :3])
                 self.to_canon[c] = (M, A[:, 3])
 
+        # Fixed-shape per-frame tensors over ALL training cameras: missing/unhealthy cameras are masked
+        # out instead of dropped, so shapes never change (no allocation spikes; CUDA-graph friendly).
+        self.order = list(train_cams)
+        self.slot = {c: i for i, c in enumerate(self.order)}
+        cam0 = self.cams[self.order[0]]
+        self.frame_buf = torch.zeros(len(self.order), cam0.height, cam0.width, 3, dtype=torch.uint8,
+                                     device=self.device)
+        self.plate_stack = torch.stack([self.plates[c] for c in self.order])
+        half = torch.diag(torch.tensor([0.5, 0.5, 1.0], device=self.device))
+        self.P_half = torch.stack([half @ self.Ks[c] @ self.viewmats[c][:3] for c in self.order])
+
         # voxel grid: rig footprint x [floor, floor + height], normalized coordinates
         down, floor = estimate_floor(seq)
         C = np.stack([cam.center for cam in seq.cameras.values()])
@@ -119,14 +130,18 @@ class VisualHull:
         uv = xc @ self.Ks[c].T
         return uv[:, :2] / uv[:, 2:].clamp(min=1e-6), xc[:, 2]
 
-    def _carve(self, x: torch.Tensor, P: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-        """Vectorized over cameras: P (V,3,4) projections, masks (V,H,W) bool."""
+    def _carve(self, x: torch.Tensor, P: torch.Tensor, masks: torch.Tensor,
+               valid: torch.Tensor | None = None) -> torch.Tensor:
+        """Vectorized over cameras: P (V,3,4) projections, masks (V,H,W) bool, valid (V,) bool —
+        an invalid camera neither sees nor carves (a lost feed must not delete people)."""
         V, H, W = masks.shape
         uvw = torch.einsum("vij,nj->vni", P[:, :, :3], x) + P[:, None, :, 3]
         z = uvw[..., 2]
         u = uvw[..., 0] / z.clamp(min=1e-6)
         v = uvw[..., 1] / z.clamp(min=1e-6)
         vis = (z > 0) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        if valid is not None:
+            vis &= valid[:, None]
         idx = v.long().clamp(0, H - 1) * W + u.long().clamp(0, W - 1)
         inside = masks.view(V, -1).gather(1, idx) & vis
         seen, hits = vis.sum(0), inside.sum(0)
@@ -152,11 +167,15 @@ class VisualHull:
         if not cams:                       # every feed lost this slot: background only
             return {"cams": [], "images": None, "voxels": torch.zeros(0, 3, device=self.device)}
         with timer("upload"):
-            u8 = torch.stack([torch.as_tensor(images[c]).to(self.device, non_blocking=True) for c in cams])
+            for c in cams:
+                self.frame_buf[self.slot[c]].copy_(torch.as_tensor(images[c]), non_blocking=True)
+            present = set(cams)
+            valid = torch.tensor([c in present for c in self.order], device=self.device)
+            u8 = self.frame_buf
         with timer("masks"):
             # half resolution, fp16: voxels project to several pixels, so full-res masks are wasted work
             x = F.avg_pool2d(u8.permute(0, 3, 1, 2).half() / 255, 2)
-            d = (x - torch.stack([self.plates[c] for c in cams])).abs().amax(1, keepdim=True)
+            d = (x - self.plate_stack).abs().amax(1, keepdim=True)
             m = (F.avg_pool2d(d, 3, 1, 1) > self.mask_thresh).half()
             if self.seg_net is not None:
                 with timer("segment"):
@@ -168,12 +187,11 @@ class VisualHull:
             coarse_m = F.max_pool2d(m, 7, 1, 3)[:, 0] > 0.5                # coarse voxels cover more pixels
             fine_m = m[:, 0] > 0.5
         with timer("carve"):
-            half = torch.diag(torch.tensor([0.5, 0.5, 1.0], device=self.device))
-            P = torch.stack([half @ self.Ks[c] @ self.viewmats[c][:3] for c in cams])
-            coarse = self.coarse_pts[self._carve(self.coarse_pts, P, coarse_m)]
+            coarse = self.coarse_pts[self._carve(self.coarse_pts, self.P_half, coarse_m, valid)]
             fine = (coarse[:, None] + self.child_offsets[None]).reshape(-1, 3)
-            fine = self._surface(fine[self._carve(fine, P, fine_m)])
-        return {"cams": cams, "images": u8, "voxels": fine}
+            fine = self._surface(fine[self._carve(fine, self.P_half, fine_m, valid)])
+        # images[i] pairs with cams[i] (views into the fixed buffer, no copies)
+        return {"cams": cams, "images": [u8[self.slot[c]] for c in cams], "voxels": fine}
 
     def _colorize(self, x, q, s, cams, images, camera: Camera):
         """View-dependent voxel colors from the real cameras nearest the virtual view (occlusion-tested)."""
